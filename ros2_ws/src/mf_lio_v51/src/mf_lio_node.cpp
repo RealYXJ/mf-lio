@@ -331,6 +331,8 @@ private:
             declare_parameter<bool>("fast_tier_writeback_enable", false);
         params_.fast_tier_enable =
             declare_parameter<bool>("fast_tier_enable", true);
+        params_.fast_tier_max_catchup_fires =
+            declare_parameter<int>("fast_tier_max_catchup_fires", 8);
         params_.disjoint_scheduling_enable =
             declare_parameter<bool>("disjoint_scheduling_enable", true);
         params_.overlap_bound_steps =

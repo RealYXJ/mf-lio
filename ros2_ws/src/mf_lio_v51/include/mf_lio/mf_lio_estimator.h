@@ -178,6 +178,13 @@ struct MfLioParams {
     // no GN correction, no /odometry_fast updates beyond whatever was last published).
     // Default true preserves all existing behavior.
     bool   fast_tier_enable          = true;
+    // Fast-tier scheduling fix: bounds how many window-sized catch-up fires
+    // the estimation loop may run in a single poll iteration when bursty
+    // transport delivery lets point_buf_ advance by more than one
+    // current_W_f_ms_ window between polls (see estimation_loop()). Keeps
+    // a long pause (e.g. during init) from spinning indefinitely while
+    // still letting ordinary 2-3 packet bursts fire once per window.
+    int    fast_tier_max_catchup_fires = 8;
     bool   fast_tier_writeback_enable = false;
     bool   disjoint_scheduling_enable = true;
     int    overlap_bound_steps       = 0;

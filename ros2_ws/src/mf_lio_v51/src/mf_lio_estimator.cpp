@@ -298,8 +298,27 @@ void MfLioEstimator::estimation_loop() {
 
         if (params_.fast_tier_enable &&
             t_now - last_fast_freq_t_ >= current_W_f_ms_ * 1e-3) {
-            fast_freq_update(t_now);
-            last_fast_freq_t_ = t_now;
+            // Catch up one window at a time instead of jumping straight to
+            // t_now (= point_buf_.latest_time()). Under bursty transport
+            // delivery, two or more packet-interval's worth of points can
+            // land in point_buf_ before this poll iteration runs, so
+            // t_now - last_fast_freq_t_ can exceed current_W_f_ms_ by more
+            // than one window. Firing a single fast_freq_update(t_now) in
+            // that case silently coalesces the whole backlog into one
+            // oversized window and advances last_fast_freq_t_ straight past
+            // the skipped window boundary -- consuming the "missing" fire
+            // and roughly halving the achieved fast-tier rate under bursty
+            // delivery (measured ~51 Hz instead of the ~100 Hz design
+            // target). Advancing by exactly one current_W_f_ms_ step per
+            // fire, bounded, restores one publish per window.
+            int catchup_fires = 0;
+            while (t_now - last_fast_freq_t_ >= current_W_f_ms_ * 1e-3 &&
+                   catchup_fires < params_.fast_tier_max_catchup_fires) {
+                const double t_step = last_fast_freq_t_ + current_W_f_ms_ * 1e-3;
+                fast_freq_update(t_step);
+                last_fast_freq_t_ = t_step;
+                ++catchup_fires;
+            }
             continue;
         }
 
