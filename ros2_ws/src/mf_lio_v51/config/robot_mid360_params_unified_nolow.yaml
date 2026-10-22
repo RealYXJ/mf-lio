@@ -30,7 +30,7 @@ mf_lio_node:
 
     filter_size_map: 0.5
     cube_side_length: 1000.0
-    num_max_iterations: 20
+    num_max_iterations: 4
     esti_plane_threshold: 0.1
     angular_gate_rad_s: 1000.0
     map_write_dist_thresh: 1000.0
