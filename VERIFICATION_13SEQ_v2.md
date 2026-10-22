@@ -452,3 +452,145 @@ drone_20260522_200119_ros2_reconstructed/` (gitignored, not committed) and the
 session scratchpad; nothing was written to the read-only HDD at
 `/mnt/Workspace/LidarWorkSpace/`, and no file under
 `ros2_ws/src/mf_lio_v51/` was modified.
+
+## HandHeld-2 speed-threshold calibration: a data-driven value, tested and reverted
+
+Follow-up on the previous section's root-cause finding — `correction_publish_max_speed`
+(default 5.0 m/s, shared by all 13 sequences, not overridden for handheld) was 100%
+responsible for HandHeld-2's corrected-stream rejections, and the previous section
+declined to guess a replacement number because there was no data to calibrate against.
+This section derives one empirically and tests it.
+
+### Step 1: measuring the real `v_pub` distribution across all 3 handheld sequences
+
+Temporarily instrumented `should_publish_corrected()` in `mf_lio_estimator.cpp`
+(one `std::ofstream` append gated by an `MF_LIO_GATE_SPEED_LOG_PATH` env var, logging
+every computed `speed` value — i.e. `‖corrected.pos − last_corrected_publish_state_.pos‖
+/ dt` — at the exact point the code already computes it, regardless of whether that
+candidate goes on to pass or fail the speed check itself; this captures the population
+of candidates that already passed the correspondence/quality/residual/innovation/rotation
+checks, which is the right population to calibrate a speed cap against). Rebuilt a
+throwaway image (`mf_lio_v51:jazzy-speedcal`, confirmed to contain the instrumentation
+and `fast_tier_max_catchup_fires`, i.e. built from current HEAD), ran all 3 handheld bags
+full-length (`ros2 bag play --rate 1.0`, no evaluation needed for this step, just the
+CSV), then **reverted the instrumentation via `git checkout` before proceeding**
+(confirmed clean via `git diff`/`git status`).
+
+| Sequence | n candidates | p50 | p90 | p95 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|---|
+| handheld_data1 | 290 | 5.170 | 6.243 | 6.589 | 7.121 | 7.252 | 7.262 |
+| handheld_data2 | 328 | 4.295 | 5.940 | 6.179 | 6.597 | 6.792 | 6.832 |
+| handheld_data3 | 185 | 2.090 | 2.402 | 2.501 | 2.831 | 2.936 | 2.939 |
+| **pooled (n=803)** | | 4.082 | 5.970 | 6.275 | 6.876 | 7.234 | **7.262** |
+
+34.99% of all pooled candidates exceed the current 5.0 m/s default; 9.46% exceed 6.0;
+only 0.87% exceed 7.0; **zero** exceed 7.5 anywhere in ~80s of combined real handheld
+motion across all 3 sequences. Notably, HandHeld-1 (not just HandHeld-2) also runs
+with a very high fraction of candidates above 5 m/s (its own median is 5.17 m/s) — this
+platform's real hand-shake dynamics routinely exceed the current default on more than
+one sequence, not just HandHeld-2.
+
+**Cross-check against what the other gate criteria already catch:** the innovation cap
+(`correction_publish_max_innovation = 0.5 m`) combined with the mid-tier's minimum
+allowed interval (`mid_freq_min_interval_ms = 50 ms`) means a single max-innovation
+correction already implies an apparent speed of at least `0.5 / 0.05 = 10 m/s`, and at
+the more typical ~100 ms cadence, `0.5 / 0.1 = 5 m/s` (plausibly where the original
+default came from). A genuinely bad correction (mismatched scan / degenerate geometry)
+producing a many-tens-of-cm-to-meters jump would in practice be caught by the 0.5 m
+innovation cap directly, independent of speed — consistent with the prior section's
+finding that 0/322 rejections in the instrumented HandHeld-2 run came from the
+innovation or rotation criteria. So there is real headroom between "real observed
+hand-shake ceiling" (max 7.262 m/s, pooled across 3 sequences) and "magnitude the other
+criteria would already flag" (≥10 m/s for a single bad correction at the minimum
+interval).
+
+**Derived value: 8.0 m/s** — chosen as the observed pooled maximum (7.262 m/s) plus
+~10% headroom, rounded to a clean number, while staying well below the ≥10 m/s floor
+implied by the innovation-cap/min-interval combination above and below
+`update_motion_guard_max_speed` (15.0 m/s, the separate, more permissive mid-tier motion
+guard already in this same config) so the publication gate remains the tighter of the
+two speed-based checks.
+
+### Step 2: applied as a handheld-only override, tested
+
+Added `correction_publish_max_speed: 8.0` to
+`handheld_mid360_params_v51_improved_nolow.yaml` only (no other canonical config
+touched). Re-ran HandHeld-2 three times, HandHeld-1 three times (one more than the
+task's minimum, because the first HandHeld-1 trial looked borderline and a single
+sample wasn't enough to tell noise from a real effect), and HandHeld-3 three times
+(same reasoning), all via `mf_lio_v51:jazzy-postfixes` (confirmed still source-current:
+`d9635bf`, this session's tip, touches no file under `ros2_ws/src/mf_lio_v51/`) with the
+edited config live-mounted, identical methodology to the rest of this document.
+
+**HandHeld-2 (ATE paper 0.2155, previous 5-trial mean 0.874, range 0.474–1.207):**
+
+| Trial | ATE RMSE | RPE mean (rmse) | corrected msgs |
+|---|---|---|---|
+| t1 | 0.473273 | 0.595808 (0.661772) | 316 |
+| t2 | 0.468631 | 0.601757 (0.666660) | 317 |
+| t3 | 0.416105 | 0.598126 (0.657757) | 316 |
+| **mean** | **0.452670** | **0.598564 (0.662063)** | |
+
+ATE mean dropped from 0.874 to 0.453 (−48%), and — just as notable as the mean
+itself — the trial-to-trial spread collapsed from a 0.474–1.207 m range (std 0.318) to
+a tight 0.416–0.473 m range, i.e. the new threshold not only moves HandHeld-2 closer to
+the paper's 0.2155 m, it removes the wide, unpredictable swings the previous
+investigation flagged. Still ~2.1× the paper's number, so not a full fix, but a clear,
+reproducible improvement.
+
+**HandHeld-1 (previous single-run reference: ATE 0.058261, RPE mean 0.994894):**
+
+| Trial | ATE RMSE | RPE mean (rmse) | corrected msgs |
+|---|---|---|---|
+| t1 | 0.064283 | 1.100926 (1.161912) | 284 |
+| t2 | 0.063118 | 1.094683 (1.158936) | 285 |
+| t3 | 0.066118 | 1.095693 (1.156996) | 286 |
+| **mean** | **0.064506 (+10.7%)** | **1.097101 (+10.3%)** | |
+
+All 3 trials land in a tight 0.063–0.066 m band (a ~5% spread) — this is not noise, it
+is a small but consistently reproducible regression on both ATE and RPE simultaneously.
+
+**HandHeld-3 (previous single-run reference: ATE 0.048851, RPE mean 0.505508):**
+
+| Trial | ATE RMSE | RPE mean (rmse) | corrected msgs |
+|---|---|---|---|
+| t1 | 0.049882 | 0.529261 (0.558489) | 185 |
+| t2 | 0.041466 | 0.546204 (0.578445) | 184 |
+| t3 | 0.041318 | 0.542303 (0.569082) | 184 |
+| **mean** | **0.044222 (−9.5%)** | **0.539256 (+6.7%)** | |
+
+HandHeld-3's own trial-to-trial ATE spread (0.041–0.050, ~20%) is comparable to or
+larger than its apparent shift from the previous reference, and ATE and RPE move in
+opposite directions relative to that reference — the signature of ordinary trial
+variance, not a systematic effect (unlike HandHeld-1's tight, same-direction,
+reproducible shift).
+
+### Step 3: decision — reverted, not committed
+
+**Per the task's own decision rule** ("if it helps HandHeld-2 but clearly hurts
+HandHeld-1/3: don't force it"), this override is **not kept**. HandHeld-2 improved
+substantially and HandHeld-3 stayed flat within normal trial noise, but HandHeld-1
+regressed by a small, tightly-reproducible ~10% on both ATE and RPE across all 3
+trials — the kind of low-variance, same-direction shift that reads as a real effect,
+not sampling noise. `correction_publish_max_speed: 8.0` was added to
+`handheld_mid360_params_v51_improved_nolow.yaml`, verified with the trials above, then
+**reverted via `git checkout`**; `git status` on
+`ros2_ws/src/mf_lio_v51/config/handheld_mid360_params_v51_improved_nolow.yaml` confirms
+it is back to the committed `d9635bf` version, byte-for-byte.
+
+The most plausible explanation, consistent with the task's own anticipated fallback: a
+single platform-wide handheld threshold isn't the right lever here. HandHeld-1's own
+`v_pub` distribution is, if anything, *more* concentrated above 5 m/s than HandHeld-2's
+(median 5.17 vs 4.30 m/s) — yet loosening the cap helped HandHeld-2 and hurt HandHeld-1.
+That asymmetry suggests the two sequences' high-speed correction candidates are not
+equivalent in quality: HandHeld-2's are apparently benign fast motion the old 5.0 m/s
+cap was wrongly rejecting, while at least some of HandHeld-1's appear to be exactly the
+kind of correction the speed gate is supposed to catch (its removal makes HandHeld-1
+worse, not just neutral). This could be genuine per-sequence tuning territory, or it
+could be downstream of the `N_max=4` / scheduling-jitter interaction flagged (but not
+isolated) in the previous section — this investigation does not distinguish between
+those two explanations. **No code or config change from this investigation is
+committed**; the only artifacts are this documentation section (left uncommitted for
+human review, matching this session's established pattern) and the scratch data under
+`scratch_out/` (gitignored-equivalent scratch area, not part of the repo tree, not
+committed).
