@@ -325,3 +325,130 @@ interpolate from either. **No code was changed and no threshold was
 modified in this investigation.** The gate remains enabled exactly as
 committed in `2057747`. `git status` confirms the only uncommitted change in
 the repository is this document itself.
+
+## UAV-2 full-coverage recovery: a second same-session bag recovers the lost 49%
+
+Follow-up on item 4 ("UAV-2 bag corruption / partial recovery"). A second bag
+on the same read-only HDD, `drone/drone_20260522_200119_ros2_liosam/
+drone_20260522_200119_ros2_liosam.db3`, was found this session. It is **not**
+a copy of the corrupted primary bag — its `metadata.yaml` reports
+`ros_distro: rosbags` (i.e. it was itself produced by a bag-rewriting tool,
+most plausibly a Livox-CustomMsg→PointCloud2 republish done at recording time
+for LIO-SAM's benefit, which cannot parse Livox's custom message type) — but
+it shares the exact same session fingerprint as the corrupted original:
+identical `starting_time` (`1779469340165684107` ns epoch), identical
+declared `duration.nanoseconds` (138453738525, i.e. 138.45s), identical
+`/livox/imu` count (27691) and identical `/livox/lidar` count (13846), and it
+**passes `sqlite3 PRAGMA integrity_check` cleanly** (`ok`). Its only
+structural difference: `/livox/lidar` is typed `sensor_msgs/msg/PointCloud2`
+instead of the original's `livox_ros_driver2/msg/CustomMsg`.
+
+### Step 1: field inspection (viability check)
+
+Used the `rosbags` Python library (`pip install --user rosbags`, already
+installed this session) to deserialize `/livox/lidar` from the `_liosam` bag.
+`PointCloud2.fields` (point_step=24 bytes): `x` (FLOAT32, off 0), `y`
+(FLOAT32, off 4), `z` (FLOAT32, off 8), `intensity` (FLOAT32, off 12), `tag`
+(UINT8, off 16), `line` (UINT8, off 17), `time` (FLOAT32, off 20). This is a
+complete, name-for-name correspondence with Livox `CustomPoint`'s
+`x,y,z,reflectivity,tag,line,offset_time` — including the critical per-point
+`time`/`offset_time` field that `CustomMsg`-based motion-undistortion
+pipelines like `mf_lio_v51` depend on. This is outcome (a) from the task's
+decision tree, not (b): nothing is missing.
+
+**Confirmed, not just plausible, that this is the same raw data, byte for
+byte:** recovered the corrupted primary bag's readable prefix again via
+`sqlite3 .recover` (scratchpad-only, 7077/13846 `/livox/lidar` `CustomMsg`
+messages, the same 51%-coverage recovery `VERIFICATION_13SEQ.md` describes),
+registered the `livox_ros_driver2/msg/CustomMsg`/`CustomPoint` definitions
+with `rosbags.typesys` (schema taken from
+`/mnt/Workspace/faster-lio/thirdparty/livox_ros_driver/msg/CustomMsg.msg` and
+cross-checked against the actual type baked into the Docker image at
+`/ws/install/livox_ros_driver2/share/livox_ros_driver2/msg/*.msg` — identical
+field layout), and compared **every one of the 7077 overlapping messages,
+14,154,144 points total**: `round(pointcloud2.time * 1e9)` against the
+original's `offset_time` (uint32 ns), `round(pointcloud2.intensity)` against
+`reflectivity`, `tag`, `line`, and `x/y/z` to 1e-6 m. **Zero mismatches across
+all 14,154,144 points** — this is a bit-exact, lossless re-encoding, not an
+approximate one. (As a side confirmation, the reconstructed `CustomMsg`'s
+independently-computed `type_description_hash` came out identical to the
+corrupted original's own declared hash,
+`RIHS01_2eb17e5e35bf5a2d6cd079f3c57f33abf95e5bf7d71b42cddc05daace73d815a`,
+for both the reconstructed topic and the unchanged `/livox/imu` topic.)
+
+Also checked (via `Explore` agent, read-only, no files modified) exactly how
+`mf_lio_v51` consumes `CustomMsg`, to confirm the reconstruction supplies
+everything the estimator actually reads:
+`ros2_ws/src/mf_lio_v51/src/mf_lio_node.cpp:628-644` computes
+`t_base = header.stamp.sec + header.stamp.nanosec*1e-9` and, per point,
+`pt.curvature = offset_time * 1e-6` (ns→ms); `mf_lio_estimator.cpp:130-151`
+finishes with `t = t_begin + pt.curvature*1e-3`, i.e. the estimator's
+per-point absolute timestamp is **`header.stamp + offset_time`**, and the
+`CustomMsg.timebase` field is **never read** anywhere in the package (a
+repo-wide grep for `timebase` found nothing outside this document). `tag` and
+`line` are likewise unused (no filtering); `reflectivity` only feeds
+`pt.intensity` directly. This means the reconstruction only needs
+`header.stamp` (preserved byte-for-byte from the PointCloud2) and per-point
+`offset_time` (exactly recoverable from the `time` field) — both of which are
+proven bit-exact above — for full numerical equivalence with what the
+estimator would have seen from the original, uncorrupted `CustomMsg` stream.
+
+### Step 2: full 138.45s replacement bag built and run
+
+Built `/home/xianjia/Workspace/LidarWorkSpace/eval_data/drone/
+drone_20260522_200119_ros2_reconstructed/` (gitignored `eval_data/` area, not
+on the read-only HDD) via a `rosbags`-based conversion script: `/livox/lidar`
+converted PointCloud2→`CustomMsg` message-by-message (`header` preserved
+as-is, `timebase` set to `header.stamp` as nanoseconds since this field is
+unused downstream, `offset_time = round(time*1e9)`, `reflectivity =
+round(intensity)`, `tag`/`line` passed through), `/livox/imu` copied through
+unchanged (raw CDR bytes, same type, no re-serialization). Result: 13846
+`/livox/lidar` + 27691 `/livox/imu` messages — **exact match** to the
+corrupted original's declared counts — spanning the full 138.449s with no
+gaps >21.6ms. `sqlite3 PRAGMA integrity_check` on the new bag: `ok`.
+
+Ran with the identical methodology as the rest of this document and
+`VERIFICATION_UAV1.md` (`mf_lio_v51:jazzy-postfixes`, confirmed current:
+`b7c7a6f` — this document's own tip commit — changed only this file, no
+source under `mf_lio_v51/`, so the image built from `2057747` remains
+source-current; independently re-verified the image contains
+`fast_tier_max_catchup_fires` and lists `mf_lio_v51_node`), same
+`mid360_params_unified_nolow.yaml`, `ros2 bag play --rate 1.0`, 5s settle, GT
+re-extracted fresh from `/vrpn_client_node/x650/pose` in the `_liosam` bag
+(15619 poses, matching the metadata count). Run was clean: no
+`error|exception|segfault|fatal` in `node.log`; `odometry_corrected.tum`
+spans `1779469340.80`–`1779469478.59` and `odometry_fast.tum` spans
+`1779469340.81`–`1779469478.61`, against GT's
+`1779469340.21`–`1779469478.61` — the **full 138.45s**, not the old 70.76s
+(51%) prefix. `evo_ape`: 1167/1288 corrected-stream timestamps matched
+(90.6%); `evo_rpe`: 10192/11265 fast-stream timestamps matched (90.5%, 296
+one-meter pairs) — both consistent with the match-rate seen on the suite's
+other full-coverage sequences, not a partial-coverage artifact.
+
+| Metric | Paper | v2 partial (70.76s/138.45s, 51%) | **v2 full (138.45s, 100%)** | Full Δ vs paper | Full vs partial |
+|---|---|---|---|---|---|
+| ATE RMSE (m) | 0.0109 | 0.010617 (−2.6%) | **0.011226** | **+3.0%** | +5.7% |
+| RPE mean@1m (m/m) | 0.3019 | 0.172163 (−43.0%) | **0.206609** | **−31.6%** | +20.0% (closer to paper) |
+
+### Assessment
+
+The PointCloud2→CustomMsg reconstruction was **fully viable** — bit-exact,
+not approximate — and this full-coverage run supersedes the old 51%-coverage
+partial result as the authoritative UAV-2 comparison. ATE remains within
+±3% of the paper either way (partial or full), i.e. this was already a solid
+match and stays one. RPE moves materially closer to the paper under full
+coverage (−31.6% vs the partial's −43.0%), though it remains the one metric
+in the UAV platform row that under-shoots the paper by a wide margin — a
+pattern already flagged suite-wide as an RPE parameterization/fast-tier-timing
+sensitivity (see "RPE systematic shift note" above), not evidence this
+specific recovery is flawed. **Item 4 in "Items flagged for human review" is
+now resolved**: a full, clean, independently-verified-bit-exact UAV-2 run
+exists; the 51%-coverage recovery is superseded, not retracted (kept above
+for the record of how it was obtained).
+
+Conversion script and the rebuilt bag live under
+`/home/xianjia/Workspace/LidarWorkSpace/eval_data/drone/
+drone_20260522_200119_ros2_reconstructed/` (gitignored, not committed) and the
+session scratchpad; nothing was written to the read-only HDD at
+`/mnt/Workspace/LidarWorkSpace/`, and no file under
+`ros2_ws/src/mf_lio_v51/` was modified.
