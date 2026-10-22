@@ -405,6 +405,24 @@ struct MfLioParams {
     // Cross-tier backward propagation + IMU preintegration consistency trigger.
     double W_l_imu_consistency_thresh = 0.0; // m; early W_l trigger on IMU-vs-scan drift (0=disabled)
     bool   backward_correction_enable = false; // retroactively correct mid-tier history after each low-tier
+
+    // RDEF / Covariance-Intersection fusion diagnostic (disclosed negative;
+    // see paper Sec. "Fast/Mid Fusion: RDEF and Covariance Intersection").
+    // Between mid-tier corrections the fast tier accumulates its own small
+    // pose correction relative to the SAME shared prior the next mid-tier
+    // update starts from, so the two posteriors are correlated. This
+    // diagnostic evaluates two fusion rules (RDEF, using the analytically
+    // known cross-covariance; CI, which does not assume it) side by side
+    // and logs trace(P_fused) for each, plus trace(P_corr_M), purely for
+    // offline inspection. Fusion is NEVER applied online: the estimator's
+    // published state/output is completely unaffected either way. Default
+    // off is a true no-op (fast-tier information bookkeeping is skipped
+    // entirely when this is false; see Lambda_F_pos_ in the estimator).
+    bool        rdef_ci_diagnostic_enable   = false;
+    // Optional CSV append-log path (mirrors low_own_map_kappa_log_path's
+    // convention): empty string disables file output even when the
+    // diagnostic itself is enabled.
+    std::string rdef_ci_diagnostic_log_path = "";
 };
 
 // Callback types for publishing from the ROS2 node
@@ -510,6 +528,14 @@ private:
     // §5 anchor-relative rotation correction (only active when fast_6dof_enable=true).
     // Accumulated body-frame rotation delta (Lie algebra) since last mid-tier.
     Eigen::Vector3d fast_delta_xi_rot_ = Eigen::Vector3d::Zero();
+    // RDEF/CI diagnostic: fast tier's own accumulated position information
+    // (Lambda_F) since the last mid-tier correction -- same reset cadence as
+    // fast_delta_xi_pos_/fast_delta_xi_rot_ above, same raw
+    // sum-of-normal-outer-products convention as last_pos_HtH_/
+    // H_m_accumulated_ below. Only accumulated when
+    // params_.rdef_ci_diagnostic_enable is true; otherwise stays zero and
+    // costs nothing per cycle.
+    Eigen::Matrix3d Lambda_F_pos_ = Eigen::Matrix3d::Zero();
     double init_time_        = 0.0;
     bool   initialized_      = false;
     bool   first_update_done_ = false;  // true after first iEKF correction — gates publication

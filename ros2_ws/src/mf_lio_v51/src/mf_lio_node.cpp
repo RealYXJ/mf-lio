@@ -365,6 +365,12 @@ private:
             declare_parameter<double>("low_own_map_kappa0", 0.05);
         params_.low_own_map_kappa_log_path =
             declare_parameter<std::string>("low_own_map_kappa_log_path", "");
+        // RDEF/CI fusion diagnostic (disclosed negative): default off is a
+        // true no-op -- see MfLioParams::rdef_ci_diagnostic_enable.
+        params_.rdef_ci_diagnostic_enable =
+            declare_parameter<bool>("rdef_ci_diagnostic_enable", false);
+        params_.rdef_ci_diagnostic_log_path =
+            declare_parameter<std::string>("rdef_ci_diagnostic_log_path", "");
         params_.shared_origin_scheduling_enable =
             declare_parameter<bool>("shared_origin_scheduling_enable", false);
         params_.fast_map_min_points =

@@ -1,5 +1,6 @@
 #include "mf_lio/mf_lio_estimator.h"
 #include "mf_lio/riekf/h_convert.hpp"
+#include "mf_lio/rdef_ci_diagnostic.h"
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -1501,6 +1502,12 @@ void MfLioEstimator::fast_freq_update(double t_now) {
                         const double afc_max = 0.5;
                         if (fast_delta_xi_pos_.norm() > afc_max)
                             fast_delta_xi_pos_ = fast_delta_xi_pos_.normalized() * afc_max;
+                        // RDEF/CI diagnostic: accumulate this fast-tier correction's own
+                        // position information (same convention as last_pos_HtH_: raw
+                        // sum of normal outer products, no extra R^-1 scaling). Gated so
+                        // it costs nothing when the diagnostic is off.
+                        if (params_.rdef_ci_diagnostic_enable)
+                            Lambda_F_pos_ += HtH.block<3,3>(0,0);
                         // §5 rotation correction: accumulate, bounded at 0.1 rad (~5.7°)
                         if (params_.fast_6dof_enable) {
                             fast_delta_xi_rot_ += delta_rot;
@@ -1830,6 +1837,9 @@ void MfLioEstimator::apply_voxel_hash_gn(state_ikfom& predicted, double t_now,
     const double afc_max = 0.5;
     if (fast_delta_xi_pos_.norm() > afc_max)
         fast_delta_xi_pos_ = fast_delta_xi_pos_.normalized() * afc_max;
+    // RDEF/CI diagnostic: same bookkeeping as the decoupled-3x3-GN path above.
+    if (params_.rdef_ci_diagnostic_enable)
+        Lambda_F_pos_ += HtH.block<3,3>(0,0);
     if (params_.fast_6dof_enable) {
         fast_delta_xi_rot_ += delta_rot;
         const double rot_max = 0.1;
@@ -2112,8 +2122,38 @@ void MfLioEstimator::mid_freq_update(double t_now) {
         fast_state_       = kf_.get_x();
         prev_kf_imu_      = kf_.get_x();
         fast_state_valid_ = true;
+
+        // RDEF/CI fusion diagnostic (disclosed negative, see paper Sec.
+        // "Fast/Mid Fusion: RDEF and Covariance Intersection"). MUST run
+        // before fast_delta_xi_pos_/Lambda_F_pos_ are reset below, so that
+        // Lambda_F_pos_ still reflects everything accumulated since the
+        // shared prior pre_cov (captured at the top of this function, before
+        // this mid-tier update ran). Strictly side-channel: reads pre_cov/
+        // kf_.get_P()/Lambda_F_pos_ but never writes back into kf_,
+        // state_point_, or anything else that feeds the published output.
+        if (params_.rdef_ci_diagnostic_enable) {
+            const Eigen::Matrix3d P0_pos       = pre_cov.block<3,3>(0,0);
+            const Eigen::Matrix3d P_corr_M_pos = kf_.get_P().block<3,3>(0,0);
+            const auto rdef = mf_lio::rdef_ci::compute_rdef_fusion(
+                P0_pos, Lambda_F_pos_, P_corr_M_pos);
+            const auto ci = mf_lio::rdef_ci::compute_ci_fusion(
+                rdef.P_corr_F, P_corr_M_pos, 101);
+            if (!params_.rdef_ci_diagnostic_log_path.empty()) {
+                std::ofstream rdef_ci_ofs(params_.rdef_ci_diagnostic_log_path, std::ios::app);
+                if (rdef_ci_ofs.is_open()) {
+                    rdef_ci_ofs << std::setprecision(17) << t_now << ','
+                                << std::setprecision(9)
+                                << rdef.P_fused_rdef.trace() << ','
+                                << ci.P_fused_ci.trace() << ','
+                                << P_corr_M_pos.trace() << ','
+                                << ci.omega << "\n";
+                }
+            }
+        }
+
         fast_delta_xi_pos_ = V3D::Zero();  // §4: reset anchor-relative delta at each anchor
         fast_delta_xi_rot_ = V3D::Zero();  // §5: reset anchor-relative rotation at each anchor
+        Lambda_F_pos_.setZero();  // RDEF/CI diagnostic: reset accumulated Λ_F at each anchor
 
         last_mid_pos_cov_trace_    = kf_.get_P().block<3,3>(0,0).trace();
         last_mid_freq_state_       = state_point_;
