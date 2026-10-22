@@ -1,0 +1,94 @@
+mf_lio_node:
+  ros__parameters:
+    lidar_topic: "/livox/lidar"
+    imu_topic: "/livox/imu"
+
+    extrinsic_T: [-0.011, -0.02329, 0.04412]
+    extrinsic_R: [1.0, 0.0, 0.0,
+                  0.0, 1.0, 0.0,
+                  0.0, 0.0, 1.0]
+    extrinsic_est_en: false
+    extrinsic_rot_cov: 0.00000001
+    extrinsic_trans_cov: 0.00000001
+
+    gyr_cov:   0.1
+    acc_cov:   0.1
+    b_gyr_cov: 0.0001
+    b_acc_cov: 0.0001
+
+    W_f_ms: 10.0
+    W_m_ms: 50.0
+    W_l_base_ms: 200.0
+    W_l_min_ms:  200.0
+    W_l_max_ms:  500.0
+    alpha: 0.5
+    beta:  0.001
+
+    edge_thresh:  0.65
+    plane_thresh: 0.75
+
+    filter_size_map: 0.5
+    cube_side_length: 1000.0
+    num_max_iterations: 10
+    esti_plane_threshold: 0.1
+    angular_gate_rad_s: 1000.0
+    map_write_dist_thresh: 1000.0
+    temporal_decay_alpha: 0.5
+    min_correspondence_quality: 0.0
+    low_freq_min_correspondences: 10
+    low_freq_min_quality: 0.02
+    low_freq_max_residual_rmse: 0.5
+    low_freq_max_pos_delta: 1.5
+    low_freq_max_rot_delta_deg: 20.0
+    publish_start_delay_ms: 0.0
+    publish_requires_stable_update: true
+    publish_stable_min_correspondences: 20
+    publish_stable_min_quality: 0.02
+    publish_stable_max_residual_rmse: 0.50
+    publish_stable_min_state_norm: 0.0
+    publish_fast_odometry_on_main: true
+    publish_corrected_odometry_on_main: true
+    correction_publish_gate_enable: false
+    low_freq_trust_enable: true
+    low_freq_trust_reject: 0.20
+    low_freq_trust_full: 0.80
+    low_freq_quality_good: 0.08
+    low_freq_residual_good: 0.05
+    low_freq_residual_bad: 0.30
+    low_freq_pos_delta_good: 0.03
+    low_freq_pos_delta_bad: 1.50
+    low_freq_rot_delta_good_deg: 1.0
+    low_freq_rot_delta_bad_deg: 20.0
+    low_freq_degen_good: 0.0001
+    low_freq_degen_bad: 0.0000001
+    low_freq_motion_good: 0.5
+    low_freq_motion_bad: 6.0
+    cov_gate_enable: false
+    cov_gate_pos_low: 0.0001
+    cov_gate_pos_high: 0.01
+    cov_gate_base: 0.4
+    mid_freq_motion_trigger: true
+    mid_freq_trigger_rot_deg: 5.0
+    mid_freq_trigger_trans_m: 0.10
+    mid_freq_min_interval_ms: 25.0
+    fast_map_update_enable: false
+    fast_map_min_points: 15
+    fast_map_min_quality: 0.03
+    fast_writeback_enable: false
+    fast_writeback_lambda_thresh: 50.0
+    fast_writeback_kappa_thresh: 500.0
+    fast_writeback_damp: 0.3
+    fast_map_voxel_size: 0.10
+    mid_degen_project_enable: false
+    mid_degen_eigen_thresh: 1.0e-3
+    mid_degen_map_gate_enable: false
+    update_motion_guard_enable: true
+    update_motion_guard_max_pos_delta: 1.5
+    update_motion_guard_max_rot_deg: 45.0
+    update_motion_guard_max_speed: 15.0
+    low_freq_ndt_enable: false
+    mid_freq_quality_min_weight: 0.3
+    mid_freq_quality_weight_power: 3.0
+    mid_freq_min_p_improvement: 0.0005
+    low_freq_quality_min_weight: 0.5
+    low_freq_quality_weight_power: 2.0

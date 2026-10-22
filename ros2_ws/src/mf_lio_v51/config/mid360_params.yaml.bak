@@ -1,0 +1,35 @@
+mf_lio_node:
+  ros__parameters:
+    lidar_topic: "/livox/lidar"
+    imu_topic: "/livox/imu"
+
+    # LiDAR-to-IMU extrinsics (from FAST-LIO2 Mid-360 calibration)
+    extrinsic_T: [-0.011, -0.02329, 0.04412]
+    extrinsic_R: [1.0, 0.0, 0.0,
+                  0.0, 1.0, 0.0,
+                  0.0, 0.0, 1.0]
+
+    # IMU noise (tune to your IMU datasheet)
+    gyr_cov:   0.1
+    acc_cov:   0.1
+    b_gyr_cov: 0.0001
+    b_acc_cov: 0.0001
+
+    # Multi-frequency windows (milliseconds) — 3-tier architecture
+    W_f_ms: 10.0     # fast_freq: fixed 100 Hz (IMU drift lock)
+    W_m_ms: 100.0    # mid_freq:  fixed 10 Hz  (FAST-LIO2 equivalent, map write)
+    W_l_base_ms: 200.0  # low_freq: adaptive 5 Hz base (dense read-only refinement)
+    W_l_min_ms:  200.0
+    W_l_max_ms:  500.0
+    alpha: 0.5    # (unused for W_f/W_m which are fixed; kept for policy W_l)
+    beta:  0.001  # near-zero: W_l fixed near W_l_base; D_degenerate proxy is too noisy
+
+    # Feature extraction thresholds (used by low_freq adaptive policy)
+    edge_thresh:  0.65
+    plane_thresh: 0.75
+
+    # Map and iEKF
+    filter_size_map: 0.2
+    cube_side_length: 1000.0
+    num_max_iterations: 4
+    esti_plane_threshold: 0.1

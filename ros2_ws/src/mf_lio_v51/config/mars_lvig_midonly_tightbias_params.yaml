@@ -1,0 +1,81 @@
+mf_lio_node:
+  ros__parameters:
+    lidar_topic: "/livox/lidar"
+    imu_topic: "/livox/imu"
+
+    # Livox Avia LiDAR-to-IMU extrinsic — fixed (FAST-LIO2 style: extrinsic_est_en=false)
+    extrinsic_T: [0.04165, 0.02326, -0.0284]
+    extrinsic_R: [1.0, 0.0, 0.0,
+                  0.0, 1.0, 0.0,
+                  0.0, 0.0, 1.0]
+    extrinsic_est_en: false
+    extrinsic_rot_cov: 0.00001
+    extrinsic_trans_cov: 0.00001
+
+    # IMU noise — matching FAST-LIO2 avia.yaml exactly (b_gyr_cov 10x tighter than v48mo)
+    gyr_cov:   0.1
+    acc_cov:   0.1
+    b_gyr_cov: 0.00001
+    b_acc_cov: 0.00001
+
+    # Low-tier DISABLED: W_l set far beyond sequence duration (341s) so the timer
+    # never fires. Mid-tier alone at 10Hz = functionally equivalent to FAST-LIO2.
+    W_f_ms: 10.0
+    W_m_ms: 100.0
+    W_l_base_ms: 999999.0
+    W_l_min_ms:  999999.0
+    W_l_max_ms:  999999.0
+    alpha: 0.5
+    beta:  0.001
+
+    # Fast-map DISABLED: MARS-LVIG records at 10Hz
+    fast_map_update_enable: false
+    fast_map_min_pts: 10
+    fast_map_max_pts: 300
+
+    # Feature extraction thresholds
+    edge_thresh:  0.65
+    plane_thresh: 0.75
+
+    # Map/scan resolution matching FAST-LIO2 avia.yaml
+    filter_size_map: 0.5
+    filter_size_scan: 0.1
+    cube_side_length: 1000.0
+    num_max_iterations: 20
+    esti_plane_threshold: 0.15
+    angular_gate_rad_s: 1000.0
+    map_write_dist_thresh: 1000.0
+    temporal_decay_alpha: 0.0
+    min_correspondence_quality: 0.0
+    low_freq_min_correspondences: 1
+    low_freq_min_quality: 0.0
+    low_freq_max_residual_rmse: 2.0
+    low_freq_max_pos_delta: 10.0
+    low_freq_max_rot_delta_deg: 90.0
+    publish_start_delay_ms: 0.0
+    publish_requires_stable_update: true
+    publish_stable_min_correspondences: 20
+    publish_stable_min_quality: 0.02
+    publish_stable_max_residual_rmse: 0.50
+    publish_stable_min_state_norm: 0.50
+    publish_fast_odometry_on_main: true
+    publish_corrected_odometry_on_main: true
+    correction_publish_gate_enable: false
+    low_freq_trust_enable: true
+    low_freq_trust_reject: 0.20
+    low_freq_trust_full: 0.80
+    low_freq_quality_good: 0.08
+    low_freq_residual_good: 0.05
+    low_freq_residual_bad: 0.30
+    low_freq_pos_delta_good: 0.03
+    low_freq_pos_delta_bad: 1.50
+    low_freq_rot_delta_good_deg: 1.0
+    low_freq_rot_delta_bad_deg: 20.0
+    low_freq_degen_good: 0.0001
+    low_freq_degen_bad: 0.0000001
+    low_freq_motion_good: 0.5
+    low_freq_motion_bad: 6.0
+    mid_degen_project_enable: false
+    mid_degen_eigen_thresh: 1.0
+    mid_degen_map_gate_enable: false
+    mid_degen_project_max_sec: 0.0
