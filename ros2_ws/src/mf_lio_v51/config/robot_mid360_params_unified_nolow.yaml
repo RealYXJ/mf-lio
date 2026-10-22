@@ -49,7 +49,7 @@ mf_lio_node:
     publish_stable_min_state_norm: 0.0
     publish_fast_odometry_on_main: true
     publish_corrected_odometry_on_main: true
-    correction_publish_gate_enable: false
+    correction_publish_gate_enable: true
     low_freq_trust_enable: true
     low_freq_trust_reject: 0.20
     low_freq_trust_full: 0.80
