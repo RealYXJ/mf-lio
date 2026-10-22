@@ -59,8 +59,8 @@ mf_lio_node:
     low_freq_trust_reject: 0.20
     low_freq_trust_full: 0.80
     low_freq_quality_good: 0.08
-    low_freq_residual_good: 0.05
-    low_freq_residual_bad: 0.30
+    low_freq_residual_good: 0.045
+    low_freq_residual_bad: 0.13
     low_freq_pos_delta_good: 0.03
     low_freq_pos_delta_bad: 1.50
     low_freq_rot_delta_good_deg: 1.0

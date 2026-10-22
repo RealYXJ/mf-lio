@@ -1,6 +1,7 @@
 #include "mf_lio/mf_lio_estimator.h"
 #include "mf_lio/riekf/h_convert.hpp"
 #include "mf_lio/rdef_ci_diagnostic.h"
+#include "mf_lio/adaptive_window_policy.h"
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -2620,26 +2621,43 @@ void MfLioEstimator::low_freq_update(double t_now) {
         policy_.update(pin_l);
     }
 
-    // AMR: adapt low-tier window using three complementary signals.
-    // q=1 → W_l_max (slow, don't disturb); q=0 → W_l_min (fire sooner).
-    //   q_rmse:  RMSE-based fit quality (reactive)
-    //   q_rmse:  RMSE-based fit quality (reactive)
-    //   q_omega: omega max-gate — high rotation forces W_l_max (protective)
-    // W_l shortened only when RMSE is high AND omega is low.
+    // Adaptive window policy (paper Sec. "Adaptive Window Policy", eq. policy):
+    // q = max(q_rmse, q_omega, q_geo); W_l <- W_l_min + (W_l_max-W_l_min)*q.
+    // q=1 -> W_l_max (accumulate evidence, don't disturb a working estimate);
+    // q=0 -> W_l_min (favor reactivity).
+    //   q_rmse: fit-quality term (UNCONDITIONAL) from the low tier's own just-
+    //           completed iEKF point-to-plane residual RMSE (last_residual_rmse_).
+    //   q_omega: rotation-rate gate (UNCONDITIONAL) from the EMA-smoothed gyro
+    //            magnitude (omega_ema_).
+    //   q_geo:  geometric-conditioning term (this work, FLAG-GATED by
+    //           low_window_geo_conditioning_enable; off by default => 0,
+    //           recovering exactly the two-term policy). Reuses the position
+    //           information block J_p (last_pos_HtH_) already accumulated for
+    //           the (disabled) mid-tier degeneracy guard -- its eigendecomposition
+    //           is computed here unconditionally on the already-accumulated
+    //           matrix when the flag is set, independent of whether
+    //           mid_degen_project_enable's own gated projection step ran.
     {
-        const double rmse_good = params_.low_freq_residual_good;
-        const double rmse_bad  = params_.low_freq_residual_bad;
-        const double denom = rmse_bad - rmse_good;
-        const double q_rmse = denom > 1e-9
-            ? std::clamp((rmse_bad - last_residual_rmse_) / denom, 0.0, 1.0)
-            : 1.0;
-        const double omega_denom = params_.W_l_omega_hi - params_.W_l_omega_lo;
-        const double q_omega = omega_denom > 1e-9
-            ? std::clamp((omega_ema_ - params_.W_l_omega_lo) / omega_denom, 0.0, 1.0)
-            : 0.0;
-        const double q = std::max(q_rmse, q_omega);
-        current_W_l_ms_ = params_.W_l_min_ms
-                         + (params_.W_l_max_ms - params_.W_l_min_ms) * q;
+        using namespace mf_lio::adaptive_window;
+
+        const double q_rmse = q_rmse_term(last_residual_rmse_,
+                                           params_.low_freq_residual_good,
+                                           params_.low_freq_residual_bad);
+        const double q_omega = q_omega_term(omega_ema_,
+                                             params_.W_l_omega_lo,
+                                             params_.W_l_omega_hi);
+
+        double q_geo = 0.0;
+        if (params_.low_window_geo_conditioning_enable && last_pos_hth_valid_) {
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_geo(last_pos_HtH_);
+            const double lambda_min_Jp = eig_geo.eigenvalues()(0);  // ascending order
+            q_geo = q_geo_term(true, lambda_min_Jp,
+                                params_.low_window_lambda_good,
+                                params_.low_window_lambda_bad);
+        }
+
+        current_W_l_ms_ = combine_window_ms(q_rmse, q_omega, q_geo,
+                                             params_.W_l_min_ms, params_.W_l_max_ms);
     }
     last_low_pos_cov_trace_ = kf_.get_P().block<3,3>(0,0).trace();
 

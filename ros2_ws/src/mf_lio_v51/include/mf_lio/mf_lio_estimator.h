@@ -144,8 +144,12 @@ struct MfLioParams {
     double low_freq_trust_reject        = 0.20;
     double low_freq_trust_full          = 0.80;
     double low_freq_quality_good        = 0.08;
-    double low_freq_residual_good       = 0.05;
-    double low_freq_residual_bad        = 0.30;
+    // Recalibrated fit-quality thresholds (paper Sec. "Adaptive Window Policy").
+    // The original 0.05/0.30 pair saturated q_rmse near 1.0 on all logged data
+    // (r sits in [0.027,0.155] m across sequences); these replace them
+    // unconditionally, not as a toggleable option.
+    double low_freq_residual_good       = 0.045;
+    double low_freq_residual_bad        = 0.13;
     double low_freq_pos_delta_good      = 0.03;
     double low_freq_pos_delta_bad       = 1.50;
     double low_freq_rot_delta_good_deg  = 1.0;
@@ -400,6 +404,16 @@ struct MfLioParams {
     double W_m_alpha    = 1.0;      // blend weight for RMSE vs omega in W_m (1.0=pure RMSE)
     double W_l_omega_lo = 0.5;      // rad/s: below this omega has no effect on W_l
     double W_l_omega_hi = 2.5;      // rad/s: above this → W_l_max (protect from fast motion)
+    // Geometric-conditioning term q_geo (paper Sec. "Adaptive Window Policy", "this
+    // work"). Optional refinement on top of the now-permanent q_rmse recalibration
+    // above; disabled by default so q_geo ≡ 0 recovers exactly the two-term
+    // (q_rmse, q_omega) policy used to produce every other result in the paper.
+    // lambda_min(J_p) is the smallest eigenvalue of the low tier's own accumulated
+    // position-information block (last_pos_HtH_, same matrix reused by the
+    // disabled mid-tier degeneracy guard).
+    bool   low_window_geo_conditioning_enable = false;
+    double low_window_lambda_good = 200.0;  // lambda_min(J_p) at/above → q_geo=0 (well-conditioned)
+    double low_window_lambda_bad  = 70.0;   // lambda_min(J_p) at/below → q_geo=1 (degenerate)
     double W_l_cov_growth_bad = 3.0; // cov growth factor at which W_l → W_l_min (e.g. 3.0 = 3x growth)
     double W_l_smooth_alpha   = 0.0; // temporal smoothing on W_l (0=instant, 0.5=half-life ≈ 1 update)
     // Cross-tier backward propagation + IMU preintegration consistency trigger.

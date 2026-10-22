@@ -285,9 +285,9 @@ private:
         params_.low_freq_quality_good =
             declare_parameter<double>("low_freq_quality_good", 0.08);
         params_.low_freq_residual_good =
-            declare_parameter<double>("low_freq_residual_good", 0.05);
+            declare_parameter<double>("low_freq_residual_good", 0.045);
         params_.low_freq_residual_bad =
-            declare_parameter<double>("low_freq_residual_bad", 0.30);
+            declare_parameter<double>("low_freq_residual_bad", 0.13);
         params_.low_freq_pos_delta_good =
             declare_parameter<double>("low_freq_pos_delta_good", 0.03);
         params_.low_freq_pos_delta_bad =
@@ -553,6 +553,12 @@ private:
         params_.W_m_alpha       = declare_parameter<double>("W_m_alpha", 1.0);
         params_.W_l_omega_lo       = declare_parameter<double>("W_l_omega_lo", 0.5);
         params_.W_l_omega_hi       = declare_parameter<double>("W_l_omega_hi", 2.5);
+        params_.low_window_geo_conditioning_enable =
+            declare_parameter<bool>("low_window_geo_conditioning_enable", false);
+        params_.low_window_lambda_good =
+            declare_parameter<double>("low_window_lambda_good", 200.0);
+        params_.low_window_lambda_bad =
+            declare_parameter<double>("low_window_lambda_bad", 70.0);
         params_.W_l_cov_growth_bad = declare_parameter<double>("W_l_cov_growth_bad", 3.0);
         params_.W_l_smooth_alpha   = declare_parameter<double>("W_l_smooth_alpha", 0.0);
         params_.W_l_imu_consistency_thresh =
