@@ -69,6 +69,20 @@ MfLioEstimator::MfLioEstimator(const MfLioParams& p) : params_(p) {
                            "n,point_valid_count,mean_quality_weight,converge\n";
         }
     }
+
+    // Diagnostic-only low-tier accept/reject log: fully inert unless MFLIO_LOWTIER_LOG is set.
+    if (const char* lowtier_path = std::getenv("MFLIO_LOWTIER_LOG")) {
+        lowtier_log_.open(lowtier_path, std::ios::out | std::ios::trunc);
+        if (lowtier_log_.is_open()) {
+            lowtier_log_enabled_ = true;
+            lowtier_log_ << "t_now,accepted,reject_reason,scalar_alpha_l,effct,quality,"
+                            "residual_rmse,pos_delta,rot_delta_deg,eig1,eig2,eig3,"
+                            "alpha1,alpha2,alpha3,corr_raw_norm,corr_applied_norm,"
+                            "corr_applied_wx,corr_applied_wy,corr_applied_wz,"
+                            "corr_applied_bx,corr_applied_by,corr_applied_bz,"
+                            "hm_eig1,hm_eig2,hm_eig3\n";
+        }
+    }
 }
 
 MfLioEstimator::~MfLioEstimator() { stop(); }
@@ -152,6 +166,7 @@ void MfLioEstimator::estimation_loop() {
             last_mid_freq_t_  = t_now - params_.W_m_ms * 1e-3;
             last_fast_freq_t_ = last_mid_freq_t_;
             last_low_freq_t_  = t_now;
+            shared_origin_t_  = t_now;
             init_time_        = t_now;
             initialized_      = true;
             continue;
@@ -193,12 +208,37 @@ void MfLioEstimator::estimation_loop() {
                 low_trigger = true;
         }
 
+        // Degeneracy-gated firing: defer this cycle (no attempt at all) if mid-tier's
+        // own accumulated info already covers every direction -- H_m_accumulated_ is
+        // left untouched so it keeps building toward the next check. Falls through to
+        // the mid-tier trigger below exactly as if low_trigger had been false.
+        if (params_.low_freq_degen_gate_enable && low_trigger &&
+            (t_now - last_low_freq_t_) <
+                params_.low_freq_degen_gate_max_interval_ms * 1e-3) {
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_gate(H_m_accumulated_);
+            if (eig_gate.eigenvalues().minCoeff() >= params_.low_freq_degen_gate_min_eig) {
+                low_trigger = false;
+            }
+        }
+
         if (low_trigger) {
             low_freq_update(t_now);
             last_low_freq_t_    = t_now;
-            if (params_.disjoint_scheduling_enable) {
-                last_mid_freq_t_    = t_now;  // prevent immediate mid_freq follow-up
+            if (params_.overlap_bound_steps > 0) {
+                // Bounded overlap: allow mid-tier to reuse at most N window-depths
+                // of data just consumed by the low tier, instead of a full reset.
+                last_mid_freq_t_  = t_now - params_.overlap_bound_steps * current_W_m_ms_ * 1e-3;
+                last_fast_freq_t_ = t_now;
+            } else if (params_.disjoint_scheduling_enable) {
+                if (params_.low_reset_tm_enable) {
+                    last_mid_freq_t_    = t_now;  // prevent immediate mid_freq follow-up
+                }
                 last_fast_freq_t_   = t_now;
+            }
+            if (params_.shared_origin_scheduling_enable) {
+                // Persistent shared origin resets only when low tier fires; mid-tier
+                // windows grow from this origin until the next low-tier reset.
+                shared_origin_t_ = t_now;
             }
             last_fast_commit_t_ = 0.0;  // reset: low/mid-tier is now the anchor
             continue;
@@ -420,12 +460,108 @@ void MfLioEstimator::h_share_model(
         }
     }
 
+    // Prototype low-tier-only map join: same pattern as use_coarse_joint above, but
+    // sourced from low_ikdtree_ (independent of mid-tier's writes) and gated to the
+    // low-tier call only.
+    const bool use_low_own_map = in_low_freq_
+        && params_.low_tier_own_map_enable
+        && low_ikdtree_.Root_Node != nullptr;
+
+    std::vector<bool>   low_valid(n, false);
+    std::vector<V3D>    low_norm(n);
+    std::vector<double> low_residual(n, 0.0);
+
+    if (use_low_own_map) {
+        if (static_cast<int>(low_nearest_points_.size()) != n)
+            low_nearest_points_.resize(n);
+
+        const float low_plane_thresh =
+            static_cast<float>(params_.esti_plane_threshold * params_.low_own_map_noise_scale);
+        const float q_min = static_cast<float>(params_.low_freq_quality_min_weight);
+
+        #pragma omp parallel for num_threads(8) schedule(guided)
+        for (int i = 0; i < n; ++i) {
+            const auto& p_body = meas_cloud_->points[i];
+            V3D pb(p_body.x, p_body.y, p_body.z);
+            V3D pw = s.rot * (s.offset_R_L_I * pb + s.offset_T_L_I) + s.pos;
+            PointType pw_pcl;
+            pw_pcl.x = static_cast<float>(pw(0));
+            pw_pcl.y = static_cast<float>(pw(1));
+            pw_pcl.z = static_cast<float>(pw(2));
+            pw_pcl.intensity = p_body.intensity;
+
+            if (ekfom_data.converge) {
+                std::vector<float> sq_dist_l(NUM_MATCH_POINTS);
+                low_ikdtree_.Nearest_Search(
+                    pw_pcl, NUM_MATCH_POINTS, low_nearest_points_[i], sq_dist_l);
+                if (static_cast<int>(low_nearest_points_[i].size()) < NUM_MATCH_POINTS
+                    || sq_dist_l.back() > 5.0f)
+                    continue;
+            }
+            if (static_cast<int>(low_nearest_points_[i].size()) < NUM_MATCH_POINTS) continue;
+
+            Eigen::Matrix<float,4,1> pabcd_l;
+            if (!esti_plane(pabcd_l, low_nearest_points_[i], low_plane_thresh))
+                continue;
+
+            float pd_l = pabcd_l(0)*pw_pcl.x + pabcd_l(1)*pw_pcl.y
+                       + pabcd_l(2)*pw_pcl.z + pabcd_l(3);
+            float s_w  = 1.0f - 0.9f * std::abs(pd_l) / std::sqrt(static_cast<float>(pb.norm()));
+            if (s_w < q_min) continue;
+
+            low_valid[i]    = true;
+            low_norm[i]     = V3D(pabcd_l(0), pabcd_l(1), pabcd_l(2));
+            low_residual[i] = -static_cast<double>(pd_l);
+        }
+    }
+
     int effct = 0;
     for (int i = 0; i < n; ++i) if (point_valid[i]) ++effct;
     int effct_c = 0;
     if (use_coarse_joint)
         for (int i = 0; i < n; ++i) if (coarse_valid[i]) ++effct_c;
-    if (effct < 1 && effct_c < 1) { ekfom_data.valid = false; return; }
+    int effct_low = 0;
+    if (use_low_own_map)
+        for (int i = 0; i < n; ++i) if (low_valid[i]) ++effct_low;
+    if (effct < 1 && effct_c < 1 && effct_low < 1) { ekfom_data.valid = false; return; }
+
+    // Anisotropic own-map trust: compare aggregate information from the own-map's
+    // rows against the main map's rows, per eigen-direction, once per call.
+    Eigen::Matrix3d low_aniso_V = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d low_aniso_beta = Eigen::Vector3d::Zero();
+    double low_kappa = 0.0;
+    if (use_low_own_map && params_.low_own_map_anisotropic_enable) {
+        Eigen::Matrix3d H_own_agg = Eigen::Matrix3d::Zero();
+        Eigen::Matrix3d H_main_agg = Eigen::Matrix3d::Zero();
+        for (int i = 0; i < n; ++i) {
+            if (low_valid[i])   H_own_agg  += low_norm[i]   * low_norm[i].transpose();
+            if (point_valid[i]) H_main_agg += norm_vecs[i] * norm_vecs[i].transpose();
+        }
+        // Attempt #6: commutator diagnostic kappa -- 3x3 position-only stand-in
+        // for the idea card's full 6x6 SE(3) information-matrix commutator norm.
+        {
+            const Eigen::Matrix3d comm = H_own_agg * H_main_agg - H_main_agg * H_own_agg;
+            const double denom = H_own_agg.norm() * H_main_agg.norm() + 1e-6;
+            low_kappa = comm.norm() / denom;
+        }
+        if (!params_.low_own_map_kappa_log_path.empty()) {
+            std::ofstream kappa_ofs(params_.low_own_map_kappa_log_path, std::ios::app);
+            if (kappa_ofs.is_open()) {
+                const double t_now_wall = std::chrono::duration<double>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                kappa_ofs << std::setprecision(17) << t_now_wall << ','
+                          << std::setprecision(9) << low_kappa << ',' << effct_low << "\n";
+            }
+        }
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_aniso(H_own_agg + H_main_agg);
+        low_aniso_V = eig_aniso.eigenvectors();
+        for (int k = 0; k < 3; ++k) {
+            const double lam_own  = low_aniso_V.col(k).dot(H_own_agg  * low_aniso_V.col(k));
+            const double lam_main = low_aniso_V.col(k).dot(H_main_agg * low_aniso_V.col(k));
+            const double d = lam_own + lam_main;
+            low_aniso_beta(k) = (d > 1e-12) ? std::clamp(lam_own / d, 0.0, 1.0) : 0.0;
+        }
+    }
 
     last_effct_ = effct;
     last_quality_ = (n > 0) ? static_cast<double>(effct) / n : 0.0;
@@ -437,7 +573,7 @@ void MfLioEstimator::h_share_model(
         last_residual_rmse_ = std::sqrt(residual_sse / std::max(effct, 1));
     }
 
-    const int effct_total = effct + effct_c;
+    const int effct_total = effct + effct_c + effct_low;
     ekfom_data.h_x = Eigen::MatrixXd::Zero(effct_total, 12);
     ekfom_data.h.resize(effct_total);
 
@@ -526,6 +662,57 @@ void MfLioEstimator::h_share_model(
             ekfom_data.h_x.block<1,3>(row, 3) = A.transpose();
             ekfom_data.h(row) = coarse_residual[i] * coarse_scale;
             ekfom_data.h_x.block<1,12>(row, 0) *= coarse_scale;
+            ++row;
+        }
+    }
+
+    // Prototype low-tier-only map rows: scaled either by a flat 1/noise_scale
+    // (isotropic, default) or by a per-row direction-dependent weight (anisotropic).
+    if (use_low_own_map) {
+        const double low_scale = 1.0 / params_.low_own_map_noise_scale;
+        const Eigen::Matrix3d beta_diag = low_aniso_beta.asDiagonal();
+        Eigen::Vector3d low_per_axis_gamma = Eigen::Vector3d::Constant(low_scale * low_scale);
+        if (params_.low_own_map_anisotropic_enable
+                && params_.low_own_map_per_axis_hybrid_enable) {
+            int k_star = 0;
+            low_aniso_beta.maxCoeff(&k_star);
+            low_per_axis_gamma(k_star) = low_aniso_beta(k_star);
+        }
+        for (int i = 0; i < n; ++i) {
+            if (!low_valid[i]) continue;
+            const auto& p_body = meas_cloud_->points[i];
+            V3D pb(p_body.x, p_body.y, p_body.z);
+            V3D p_imu = s.offset_R_L_I * pb + s.offset_T_L_I;
+            M3D p_crossmat;
+            p_crossmat << SKEW_SYM_MATRX(p_imu);
+            V3D C = s.rot.conjugate() * low_norm[i];
+            V3D A = p_crossmat * C;
+            ekfom_data.h_x.block<1,3>(row, 0) = low_norm[i].transpose();
+            ekfom_data.h_x.block<1,3>(row, 3) = A.transpose();
+            ekfom_data.h(row) = low_residual[i];
+            double w;
+            if (params_.low_own_map_anisotropic_enable
+                    && params_.low_own_map_per_axis_hybrid_enable) {
+                const double proj = low_norm[i].transpose() * low_aniso_V
+                                    * low_per_axis_gamma.asDiagonal()
+                                    * low_aniso_V.transpose() * low_norm[i];
+                w = std::sqrt(std::clamp(proj, 1e-6, 1.0));
+            } else if (params_.low_own_map_anisotropic_enable) {
+                const double proj = low_norm[i].transpose() * low_aniso_V * beta_diag
+                                    * low_aniso_V.transpose() * low_norm[i];
+                const double w_aniso = std::sqrt(std::clamp(proj, 1e-6, 1.0));
+                double mix;
+                if (params_.low_own_map_kappa_gate_enable) {
+                    mix = 1.0 / (1.0 + low_kappa / std::max(params_.low_own_map_kappa0, 1e-9));
+                } else {
+                    mix = std::clamp(params_.low_own_map_aniso_mix, 0.0, 1.0);
+                }
+                w = (1.0 - mix) * low_scale + mix * w_aniso;
+            } else {
+                w = low_scale;
+            }
+            ekfom_data.h(row) *= w;
+            ekfom_data.h_x.block<1,12>(row, 0) *= w;
             ++row;
         }
     }
@@ -1090,9 +1277,13 @@ void MfLioEstimator::fast_freq_update(double t_now) {
                             last_fast_commit_t_ = t_now;
                             fast_quality_ok     = true;
                         }
-                        // Always restore kf_ and P — fine estimator is never touched by fast-tier.
-                        kf_.change_x(x_kf_now);
-                        kf_.change_P(P_kf_now);
+                        // Restore kf_ and P unless write-back is enabled AND the correction
+                        // was accepted by the quality gate — in that case, let the fast-tier
+                        // correction persist in the shared filter for mid/low tiers to inherit.
+                        if (!(params_.fast_tier_writeback_enable && fast_quality_ok)) {
+                            kf_.change_x(x_kf_now);
+                            kf_.change_P(P_kf_now);
+                        }
                         // AMR: degenerate coarse map → pre-empt mid-tier immediately.
                         if (params_.fast_degen_early_mid_enable && last_pos_hth_valid_) {
                             Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_f(last_pos_HtH_);
@@ -1723,7 +1914,9 @@ bool MfLioEstimator::run_graph_update(double t_now) {
 // this prevents double-counting Fisher info in H_m_accumulated_ for the IGR.
 // ---------------------------------------------------------------------------
 void MfLioEstimator::mid_freq_update(double t_now) {
-    double t_start = t_now - current_W_m_ms_ * 1e-3;
+    double t_start = params_.shared_origin_scheduling_enable
+        ? shared_origin_t_
+        : (t_now - current_W_m_ms_ * 1e-3);
     auto scan = collect_and_undistort(t_start, t_now);
     if (!scan || scan->empty()) return;
 
@@ -2125,6 +2318,26 @@ void MfLioEstimator::low_freq_update(double t_now) {
             pos_delta > params_.low_freq_max_pos_delta ||
             rot_delta_deg > params_.low_freq_max_rot_delta_deg ||
             !motion_ok;
+        // Diagnostic-only accumulators for MFLIO_LOWTIER_LOG (see below); harmless
+        // when logging is disabled, never read by the actual estimator logic.
+        Eigen::Vector3d log_lam_l = Eigen::Vector3d::Zero();
+        Eigen::Vector3d log_alpha_k = Eigen::Vector3d::Zero();
+        double log_corr_raw_norm = 0.0;
+        double log_corr_applied_norm = 0.0;
+        Eigen::Vector3d log_corr_applied_world = Eigen::Vector3d::Zero();
+        Eigen::Vector3d log_corr_applied_body  = Eigen::Vector3d::Zero();
+        bool log_trust_reject = false;
+        bool log_low_trust_floor_reject = false;
+        // Diagnostic-only: eigenvalues of the mid-tier's own accumulated Fisher info
+        // (H_m_captured, captured above before this low-tier attempt began). Used to
+        // characterize whether mid-tier was already well-conditioned in all directions
+        // at firing time -- the basis for a future degeneracy-gated firing policy.
+        Eigen::Vector3d log_hm_eig = Eigen::Vector3d::Zero();
+        if (lowtier_log_enabled_) {
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_hm(H_m_captured);
+            log_hm_eig = eig_hm.eigenvalues();
+        }
+
         bool accepted_low_update = true;
         if (!params_.low_freq_trust_enable) {
             if (reject_low_update) {
@@ -2134,6 +2347,7 @@ void MfLioEstimator::low_freq_update(double t_now) {
                 accepted_low_update = false;
             }
         } else if (reject_low_update || scalar_alpha_l <= params_.low_freq_trust_reject) {
+            log_trust_reject = !reject_low_update && scalar_alpha_l <= params_.low_freq_trust_reject;
             kf_.change_x(pre_upd);
             kf_.change_P(pre_cov);
             state_point_ = pre_upd;
@@ -2160,6 +2374,30 @@ void MfLioEstimator::low_freq_update(double t_now) {
                 alpha_k(k) = (d > 1e-12) ? std::clamp(ll / d, 0.0, 1.0) : 0.0;
             }
 
+            // Ablation-only: replace the continuous per-axis blend with a hard
+            // per-axis accept/reject. An axis clearing the threshold gets the
+            // low tier's full raw correction instead of a damped fraction of
+            // it; an axis below threshold gets none at all instead of a small
+            // biased nudge. Default off (threshold check skipped) preserves
+            // the original continuous alpha_k values.
+            if (params_.low_freq_axis_gate_enable) {
+                for (int k = 0; k < 3; k++) {
+                    alpha_k(k) = (alpha_k(k) >= params_.low_freq_axis_gate_thresh) ? 1.0 : 0.0;
+                }
+            }
+
+            // Ablation-only: if even the best-trusted direction is below the floor,
+            // skip the correction entirely (full rollback) instead of applying a
+            // heavily-damped update. Default floor 0.0 never triggers (preserves
+            // existing always-damp-and-apply behavior).
+            if (params_.low_freq_min_trust_alpha > 0.0 &&
+                alpha_k.maxCoeff() < params_.low_freq_min_trust_alpha) {
+                kf_.change_x(pre_upd);
+                kf_.change_P(pre_cov);
+                state_point_ = pre_upd;
+                accepted_low_update = false;
+                log_low_trust_floor_reject = true;
+            } else {
             // 3×3 position blend matrix: A_pos = V * diag(alpha_k) * V^T.
             // Applies direction-specific trust to the iEKF position correction.
             const Eigen::Matrix3d A_pos = V * alpha_k.asDiagonal() * V.transpose();
@@ -2167,6 +2405,15 @@ void MfLioEstimator::low_freq_update(double t_now) {
             const Eigen::Vector3d dp = state_point_.pos - pre_upd.pos;
             state_point_.pos = pre_upd.pos + A_pos * dp;
             kf_.change_x(state_point_);
+
+            // Diagnostic-only capture for MFLIO_LOWTIER_LOG.
+            log_lam_l = lam_l;
+            log_alpha_k = alpha_k;
+            log_corr_raw_norm = dp.norm();
+            const Eigen::Vector3d applied_vec = A_pos * dp;
+            log_corr_applied_norm = applied_vec.norm();
+            log_corr_applied_world = applied_vec;
+            log_corr_applied_body  = state_point_.rot.conjugate() * applied_vec;
 
             // Covariance-consistent update via information filter for position block.
             // Ω_fused = Σ_pre_pos^{-1} + H_l_eff  →  Σ_pos_fused = Ω_fused^{-1}
@@ -2186,6 +2433,44 @@ void MfLioEstimator::low_freq_update(double t_now) {
             auto fused_cov = post_cov;
             fused_cov.block<3,3>(3,3) = Sigma_pos_fused;
             kf_.change_P(fused_cov);
+            }
+        }
+
+        // Diagnostic-only low-tier accept/reject log (MFLIO_LOWTIER_LOG). Computes
+        // eigenvalues of last_pos_HtH_ independently of the fusion branch above so a
+        // rejected attempt still gets diagnosed. No effect on estimation when disabled.
+        if (lowtier_log_enabled_) {
+            std::string reject_reason;
+            if (!accepted_low_update) {
+                if (last_effct_ < params_.low_freq_min_correspondences) reject_reason += "low_effct;";
+                if (quality < params_.low_freq_min_quality) reject_reason += "low_quality;";
+                if (params_.min_correspondence_quality > 0.0 &&
+                    quality < params_.min_correspondence_quality) reject_reason += "low_quality_global;";
+                if (last_residual_rmse_ > params_.low_freq_max_residual_rmse) reject_reason += "high_residual;";
+                if (pos_delta > params_.low_freq_max_pos_delta) reject_reason += "big_pos_delta;";
+                if (rot_delta_deg > params_.low_freq_max_rot_delta_deg) reject_reason += "big_rot_delta;";
+                if (!motion_ok) reject_reason += "motion_reject;";
+                if (log_trust_reject) reject_reason += "trust_reject;";
+                if (log_low_trust_floor_reject) reject_reason += "low_trust_floor;";
+                if (reject_reason.empty()) reject_reason = "unknown;";
+            }
+            Eigen::Vector3d eig_for_log = log_lam_l;
+            if (eig_for_log.isZero(0) && last_pos_hth_valid_) {
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig_diag(last_pos_HtH_);
+                eig_for_log = eig_diag.eigenvalues();
+            }
+            lowtier_log_ << std::setprecision(17) << t_now << ',' << (accepted_low_update ? 1 : 0)
+                         << ',' << reject_reason << ',' << std::setprecision(9) << scalar_alpha_l
+                         << ',' << last_effct_ << ',' << quality << ',' << last_residual_rmse_
+                         << ',' << pos_delta << ',' << rot_delta_deg
+                         << ',' << eig_for_log(0) << ',' << eig_for_log(1) << ',' << eig_for_log(2)
+                         << ',' << log_alpha_k(0) << ',' << log_alpha_k(1) << ',' << log_alpha_k(2)
+                         << ',' << log_corr_raw_norm << ',' << log_corr_applied_norm
+                         << ',' << log_corr_applied_world(0) << ',' << log_corr_applied_world(1)
+                         << ',' << log_corr_applied_world(2)
+                         << ',' << log_corr_applied_body(0) << ',' << log_corr_applied_body(1)
+                         << ',' << log_corr_applied_body(2)
+                         << ',' << log_hm_eig(0) << ',' << log_hm_eig(1) << ',' << log_hm_eig(2) << '\n';
         }
 
         // Graph refinement after accepted low-tier update.
@@ -2211,8 +2496,38 @@ void MfLioEstimator::low_freq_update(double t_now) {
                 low_world_pts.push_back(wp);
             }
             ikdtree_.Add_Points(low_world_pts, true);
-            if (coarse_ikdtree_.Root_Node != nullptr)
+            // Match mid-tier's own coarse-map write gate exactly (mid_freq_update's
+            // analogous block): only touch coarse_ikdtree_ when async_100hz_enable is
+            // on. Without this, low-tier would write into the coarse map even when
+            // mid-tier never does under canonical (async-disabled) settings -- an
+            // asymmetry with no relation to the fine-map-enrichment hypothesis being
+            // tested, and an uncontrolled confound for fast-tier's coarse-map queries.
+            if (params_.async_100hz_enable && coarse_ikdtree_.Root_Node != nullptr)
                 coarse_ikdtree_.Add_Points(low_world_pts, true);
+        }
+
+        // Prototype (attempt #5): populate the independent low-tier-only map.
+        // Uses the same accepted-update points as above but a SEPARATE tree that
+        // mid-tier never writes to, so it reflects only the low tier's own
+        // observation history rather than one continuously overwritten by
+        // mid-tier's more frequent, drift-following corrections.
+        if (params_.low_tier_own_map_enable && accepted_low_update) {
+            PointVector low_own_pts;
+            low_own_pts.reserve(scan_ds->size());
+            for (const auto& p : scan_ds->points) {
+                const V3D pb(p.x, p.y, p.z);
+                const V3D pw = state_point_.rot * (state_point_.offset_R_L_I * pb
+                               + state_point_.offset_T_L_I) + state_point_.pos;
+                PointType wp; wp.x=static_cast<float>(pw.x());
+                wp.y=static_cast<float>(pw.y()); wp.z=static_cast<float>(pw.z());
+                low_own_pts.push_back(wp);
+            }
+            if (low_ikdtree_.Root_Node == nullptr) {
+                low_ikdtree_.set_downsample_param(static_cast<float>(params_.filter_size_map));
+                low_ikdtree_.Build(low_own_pts);
+            } else {
+                low_ikdtree_.Add_Points(low_own_pts, true);
+            }
         }
 
         // v19v4: sync fast tracking state from accepted low-tier fine estimate.

@@ -7,6 +7,7 @@
 #include <deque>
 #include <vector>
 #include <fstream>
+#include <string>
 
 #include <Eigen/Dense>
 #include <pcl/point_cloud.h>
@@ -110,6 +111,36 @@ struct MfLioParams {
     // Reliability-aware low-frequency fusion. The dense low-tier update can
     // improve accuracy, but only when its residuals and innovation are sane.
     bool   low_freq_trust_enable        = true;
+    // Ablation-only: skip the low-tier position correction entirely (instead of
+    // damping-and-applying) when the best-trusted position direction still falls
+    // below this floor. Default 0.0 preserves existing behavior (always apply the
+    // damped correction). See MFLIO_LOWTIER_LOG alpha_k measurements: median trust
+    // never exceeded ~0.36 on any tested sequence.
+    double low_freq_min_trust_alpha     = 0.0;
+    // Ablation-only: skip the low-tier attempt ENTIRELY (no scan gather, no dense
+    // correspondence search, no t_m/t_f timer reset) when the mid-tier's own
+    // accumulated position Fisher info (H_m_accumulated_, reset each low-tier fire)
+    // is already well-conditioned in every direction -- i.e. mid tier was not actually
+    // starved for information in the window just completed. Distinct from
+    // low_freq_min_trust_alpha: that gate looks at alpha_k AFTER paying for the dense
+    // scan match; this gate decides BEFORE, using only mid-tier's own info, and (when
+    // it skips) avoids the mid/fast timer-reset cost entirely. Default off preserves
+    // existing behavior. max_interval_ms is an independent safety cap so a genuinely
+    // well-conditioned stretch cannot suppress low-tier firing forever.
+    bool   low_freq_degen_gate_enable        = false;
+    double low_freq_degen_gate_min_eig       = 0.0;
+    double low_freq_degen_gate_max_interval_ms = 2000.0;
+    // Ablation-only: binarize the per-axis trust weight alpha_k instead of
+    // soft-blending it. When enabled, any axis with alpha_k >= threshold is
+    // applied at FULL strength (alpha=1, low-tier fully authoritative on that
+    // axis) rather than damped; any axis below threshold is hard-zeroed
+    // (alpha=0, mid-tier's estimate kept exactly) rather than nudged by a
+    // small, chronically-biased amount. Targets the diagnosed root cause of
+    // the low tier's ATE cost: small biased corrections applied on EVERY
+    // firing even in directions mid-tier already covers well. Default off
+    // preserves the existing continuous soft-blend behavior.
+    bool   low_freq_axis_gate_enable = false;
+    double low_freq_axis_gate_thresh = 0.35;
     double low_freq_trust_reject        = 0.20;
     double low_freq_trust_full          = 0.80;
     double low_freq_quality_good        = 0.08;
@@ -143,7 +174,16 @@ struct MfLioParams {
     // no GN correction, no /odometry_fast updates beyond whatever was last published).
     // Default true preserves all existing behavior.
     bool   fast_tier_enable          = true;
+    bool   fast_tier_writeback_enable = false;
     bool   disjoint_scheduling_enable = true;
+    int    overlap_bound_steps       = 0;
+    // Ablation-only: isolates the t_m component of eq:reset_low (the mid-tier timer
+    // reset that fires when the low tier completes) from the t_f component, which
+    // stays governed by disjoint_scheduling_enable alone. Default true preserves all
+    // existing behavior; only takes effect when disjoint_scheduling_enable is true
+    // and overlap_bound_steps == 0.
+    bool   low_reset_tm_enable       = true;
+    bool   shared_origin_scheduling_enable = false;
     int    fast_map_min_points       = 20;    // skip if scan too sparse
     double fast_map_min_quality      = 0.03;  // skip if correspondence quality too low
     double fast_map_voxel_size       = 0.10;  // downsampling for the 10ms scan
@@ -229,6 +269,60 @@ struct MfLioParams {
     // Coarse rows are scaled by 1/joint_coarse_noise_scale (default 3 = 0.3m/0.1m voxel ratio).
     bool   joint_coarse_enable         = true;
     double joint_coarse_noise_scale    = 3.0;
+    // Prototype (attempt #5): a genuinely independent low-tier-only map, distinct
+    // from ikdtree_/coarse_ikdtree_ which mid-tier continuously rewrites. Populated
+    // only from the low tier's own accepted wide-window scans, so it reflects an
+    // independent reconstruction of the environment rather than one that already
+    // absorbs mid-tier's own recent corrections -- the structural limitation shared
+    // by every prior low-tier redesign attempt. Rows from low_ikdtree_ are stacked
+    // into h_share_model exactly like the coarse-map join, scaled by
+    // 1/low_own_map_noise_scale. Default off: no-op when disabled.
+    bool   low_tier_own_map_enable     = false;
+    double low_own_map_noise_scale     = 3.0;
+    // Anisotropic refinement: instead of a flat noise_scale applied uniformly to
+    // every own-map row, weight each row by how much its normal direction aligns
+    // with an eigen-direction where the own-map's own accumulated information
+    // (H_own_agg) exceeds the main-map's (H_main_agg) -- i.e. trust the own-map
+    // strongly exactly where it disagrees with/adds to the main map, and weakly
+    // where the main map already dominates. Same alpha_k logic used for the
+    // pose-blend attempts, applied at the row level instead of the state level.
+    // Default off preserves the flat-noise_scale (isotropic) behavior.
+    bool   low_own_map_anisotropic_enable = false;
+    // Hybrid mix: 0.0 = pure isotropic (flat noise_scale, RPE-favoring), 1.0 = pure
+    // anisotropic (per-direction trust, ATE-favoring). Only used when
+    // low_own_map_anisotropic_enable is true; linearly interpolates the per-row
+    // weight between the two schemes.
+    double low_own_map_aniso_mix = 1.0;
+    // Per-axis hybrid: instead of blending the SCALAR weight uniformly (aniso_mix),
+    // apply full anisotropic (beta_k) trust on ONLY the single worst-conditioned
+    // eigen-direction (argmax beta_k -- the axis where the own-map's own info most
+    // exceeds the main map's) and fall back to the flat isotropic weight on the
+    // other two axes. A row's normal that isn't purely aligned with one axis still
+    // gets a smooth quadratic-form blend, since gamma is applied through the same
+    // V*diag(gamma)*V^T projection as the full-anisotropic scheme -- only the VALUES
+    // on the non-selected axes are pinned back to the isotropic-equivalent instead
+    // of their own beta_k. Takes priority over aniso_mix when enabled.
+    bool low_own_map_per_axis_hybrid_enable = false;
+    // Attempt #6: commutator diagnostic kappa. Measures how far H_own_agg and
+    // H_main_agg (the two 3x3 position-information aggregates already computed
+    // for the anisotropic beta_k weighting above) are from commuting. kappa=0
+    // means the two sources share an eigenbasis exactly -- the per-eigendirection
+    // beta_k comparison is well-founded; kappa large means they disagree on what
+    // the 'principal directions' even are, so applying a per-direction trust
+    // ratio is comparing apples to oranges. This is a 3x3 position-only stand-in
+    // for the idea card's full 6x6 SE(3) information-matrix commutator -- a full
+    // 6-DoF port is out of scope for this pass.
+    // When low_own_map_kappa_gate_enable is true, replaces the aniso_mix scalar
+    // in the plain-anisotropic branch (per-axis-hybrid branch untouched, out of
+    // scope) with gate(kappa) = 1/(1+kappa/kappa0): full anisotropic trust at
+    // kappa=0, falling back toward the always-safe isotropic floor as kappa
+    // grows past kappa0. Default off preserves prior behavior exactly.
+    bool   low_own_map_kappa_gate_enable = false;
+    double low_own_map_kappa0 = 0.05;  // placeholder; calibrate from Quad-3 median
+    // Optional CSV diagnostic log of (wall_time_s, kappa, effct_low) appended once
+    // per h_share_model call when own-map anisotropic fusion is active. Empty
+    // string (default) disables logging entirely -- no-op.
+    std::string low_own_map_kappa_log_path = "";
     // Adaptive scheduling: trigger mid/low tier on motion thresholds instead of fixed time.
     // Slow motion → longer accumulation windows → better plane normals → lower ATE.
     bool   mid_adaptive_enable           = false;
@@ -398,10 +492,12 @@ private:
     state_ikfom state_point_;
     KD_TREE<PointType> ikdtree_;          // fine map (0.1m), written by low-tier
     KD_TREE<PointType> coarse_ikdtree_;   // coarse map (0.3m), written by 100Hz + low-tier
+    KD_TREE<PointType> low_ikdtree_;      // prototype: low-tier-only independent map
 
     double last_fast_freq_t_    = 0.0;
     double last_mid_freq_t_     = 0.0;
     double last_low_freq_t_     = 0.0;
+    double shared_origin_t_     = 0.0;
     double last_fast_map_gn_t_  = 0.0;  // rate-limits fast-map GN to avoid thread overload
     double last_fast_commit_t_  = 0.0;  // v18: last time fast-tier iEKF committed (pub_anchor)
     // v19v4 dual-state: fast tracking state, separate from kf_ (fine localization state)
@@ -426,6 +522,7 @@ private:
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr meas_cloud_;
     std::vector<PointVector> nearest_points_;
     std::vector<PointVector> coarse_nearest_points_;  // v19: NN buffer for coarse iEKF
+    std::vector<PointVector> low_nearest_points_;     // prototype: NN buffer for low_ikdtree_
     int meas_size_{0};
     bool in_low_freq_   = false;  // TCW flag: active during low-tier kf_.update call
     bool in_async_freq_ = false;  // v19: active during 100Hz async iEKF on coarse map
@@ -558,6 +655,11 @@ private:
     // No effect on estimation when unset (jitter_log_enabled_ stays false).
     bool jitter_log_enabled_ = false;
     std::ofstream jitter_log_;
+
+    // Diagnostic-only: low-tier accept/reject + per-axis trust instrumentation,
+    // gated by MFLIO_LOWTIER_LOG env var. No effect on estimation when unset.
+    bool lowtier_log_enabled_ = false;
+    std::ofstream lowtier_log_;
     long jitter_mid_call_idx_ = 0;
     long jitter_low_call_idx_ = 0;
     long jitter_h_call_idx_ = 0;

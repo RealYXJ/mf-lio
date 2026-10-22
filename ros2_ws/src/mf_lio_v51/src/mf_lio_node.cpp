@@ -327,10 +327,46 @@ private:
         // Fast-tier read-only map correction
         params_.fast_map_update_enable =
             declare_parameter<bool>("fast_map_update_enable", false);
+        params_.fast_tier_writeback_enable =
+            declare_parameter<bool>("fast_tier_writeback_enable", false);
         params_.fast_tier_enable =
             declare_parameter<bool>("fast_tier_enable", true);
         params_.disjoint_scheduling_enable =
             declare_parameter<bool>("disjoint_scheduling_enable", true);
+        params_.overlap_bound_steps =
+            declare_parameter<int>("overlap_bound_steps", 0);
+        params_.low_reset_tm_enable =
+            declare_parameter<bool>("low_reset_tm_enable", true);
+        params_.low_freq_min_trust_alpha =
+            declare_parameter<double>("low_freq_min_trust_alpha", 0.0);
+        params_.low_freq_degen_gate_enable =
+            declare_parameter<bool>("low_freq_degen_gate_enable", false);
+        params_.low_freq_degen_gate_min_eig =
+            declare_parameter<double>("low_freq_degen_gate_min_eig", 0.0);
+        params_.low_freq_degen_gate_max_interval_ms =
+            declare_parameter<double>("low_freq_degen_gate_max_interval_ms", 2000.0);
+        params_.low_freq_axis_gate_enable =
+            declare_parameter<bool>("low_freq_axis_gate_enable", false);
+        params_.low_freq_axis_gate_thresh =
+            declare_parameter<double>("low_freq_axis_gate_thresh", 0.35);
+        params_.low_tier_own_map_enable =
+            declare_parameter<bool>("low_tier_own_map_enable", false);
+        params_.low_own_map_noise_scale =
+            declare_parameter<double>("low_own_map_noise_scale", 3.0);
+        params_.low_own_map_anisotropic_enable =
+            declare_parameter<bool>("low_own_map_anisotropic_enable", false);
+        params_.low_own_map_aniso_mix =
+            declare_parameter<double>("low_own_map_aniso_mix", 1.0);
+        params_.low_own_map_per_axis_hybrid_enable =
+            declare_parameter<bool>("low_own_map_per_axis_hybrid_enable", false);
+        params_.low_own_map_kappa_gate_enable =
+            declare_parameter<bool>("low_own_map_kappa_gate_enable", false);
+        params_.low_own_map_kappa0 =
+            declare_parameter<double>("low_own_map_kappa0", 0.05);
+        params_.low_own_map_kappa_log_path =
+            declare_parameter<std::string>("low_own_map_kappa_log_path", "");
+        params_.shared_origin_scheduling_enable =
+            declare_parameter<bool>("shared_origin_scheduling_enable", false);
         params_.fast_map_min_points =
             declare_parameter<int>("fast_map_min_points", 20);
         params_.fast_map_min_quality =
