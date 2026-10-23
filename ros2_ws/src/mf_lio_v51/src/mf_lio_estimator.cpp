@@ -1183,7 +1183,13 @@ void MfLioEstimator::fast_freq_update(double t_now) {
             const double t_win_start = last_fast_freq_t_;
             const double t_win_len   = std::max(t_now - last_fast_freq_t_, 1e-9);
             const int n_raw = static_cast<int>(raw_pts.size());
-            const int stride = std::max(1, n_raw / 300);
+            // Ceiling division so floor(n_raw/stride) <= N_max=300 is actually
+            // respected (paper Sec. "Fast-Tier Map Correction": "every s-th
+            // point selected so that floor(N/s) <= N_max=300"). Plain integer
+            // division n_raw/300 truncates toward zero and under-selects stride,
+            // letting the sampled count exceed 300 (e.g. n_raw=2000 gives
+            // stride=6 -> 334 points instead of ceil(2000/300)=7 -> 286).
+            const int stride = std::max(1, (n_raw + 299) / 300);
 
             // Predict IMU states at window start and end (read-only, no side effects)
             const state_ikfom x_ws = imu_proc_.predict_state(anchor_t, last_fast_freq_t_, kf_state);
@@ -1741,7 +1747,10 @@ void MfLioEstimator::apply_voxel_hash_gn(state_ikfom& predicted, double t_now,
     const double t_win_start = last_fast_freq_t_;
     const double t_win_len   = std::max(t_now - last_fast_freq_t_, 1e-9);
     const int    n_raw       = static_cast<int>(raw_pts.size());
-    const int    stride      = std::max(1, n_raw / 300);
+    // Ceiling division -- see the identical fix/comment in fast_freq_update's
+    // decoupled-3x3-GN stride computation above; plain n_raw/300 truncation
+    // lets the sampled point count exceed the documented N_max=300 cap.
+    const int    stride      = std::max(1, (n_raw + 299) / 300);
     const int    npts        = (n_raw + stride - 1) / stride;
     if (jitter_log_enabled_) jitter_log_ << "vh_npts," << npts << ',' << params_.fast_map_min_points << "\n";
     if (npts < params_.fast_map_min_points) return;
@@ -2482,7 +2491,16 @@ void MfLioEstimator::low_freq_update(double t_now) {
             // This is the exact Bayesian posterior; the old linear cov-blend was not.
             const Eigen::Matrix3d H_l_eff =
                 V * (alpha_k.cwiseProduct(lam_l)).asDiagonal() * V.transpose();
-            const Eigen::Matrix3d Sigma_pre_pos = pre_cov.block<3,3>(3,3);
+            // Position occupies indices 0-2 of the 23-dim IKFoM error state
+            // (pos, rot, offset_R_L_I, offset_T_L_I, vel, bg, ba, grav -- see
+            // use-ikfom.hpp's MTK_BUILD_MANIFOLD declaration order, and every
+            // other position-covariance extraction in this file, e.g. the
+            // pre_pos_trace/post_pos_trace/P0_pos/last_mid_pos_cov_trace_/
+            // last_low_pos_cov_trace_ uses of block<3,3>(0,0) above). Indices
+            // 3-5 are rotation -- using them here was a copy-paste indexing
+            // bug that fused a position information matrix into the rotation
+            // covariance block.
+            const Eigen::Matrix3d Sigma_pre_pos = pre_cov.block<3,3>(0,0);
             static constexpr double COV_EPS = 1e-12;
             const Eigen::Matrix3d Sigma_pos_fused =
                 (Sigma_pre_pos.inverse() + H_l_eff +
@@ -2491,7 +2509,7 @@ void MfLioEstimator::low_freq_update(double t_now) {
             // Use iEKF posterior for all DOFs (rotation, velocity, bias handled by iEKF gain);
             // replace only the position block with the information-filter posterior.
             auto fused_cov = post_cov;
-            fused_cov.block<3,3>(3,3) = Sigma_pos_fused;
+            fused_cov.block<3,3>(0,0) = Sigma_pos_fused;
             kf_.change_P(fused_cov);
             }
         }
