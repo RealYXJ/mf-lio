@@ -733,3 +733,134 @@ to see if the variance itself — not just the mean — shrinks), rather than fu
 low-tier tuning. No canonical config file or suite-wide default was changed; the test
 config (`handheld_mid360_params_v51_improved_lowtier_test.yaml`) and this section are
 left uncommitted for human review.
+
+## HandHeld-2: testing `mid_freq_motion_trigger: false` (v45/v48 historical pairing)
+
+A third hypothesis, surfaced independently of the two above: `mf_lio_research_summary.md`
+Section 4 states, under `v45 — Baseline Three-Tier`, *"Covariance gate + motion trigger
+enabled — catastrophic regression on handheld (ATE diverges); **both disabled from v48
+onward**"* (repeated in the "lessons learned" table: *"Covariance gate + motion trigger
+together | Catastrophic on handheld sequences; disable both"*). Cross-checking the
+current reconstructed header (`mf_lio_estimator.h`): `cov_gate_enable` defaults to `true`
+in the struct, but every canonical handheld config (including `_nolow.yaml`) explicitly
+sets `cov_gate_enable: false` — so the covariance-gate half of the historical pairing is
+confirmed off. **Correction to this section's own starting premise**: an earlier framing
+of this task mislabeled `update_motion_guard_enable` as "the covariance gate" — it is not;
+that parameter (`update_motion_guard_max_pos_delta/rot_deg/speed`) is a separate
+state-update sanity clamp, distinct from `cov_gate_enable`/`cov_gate_pos_low`/
+`cov_gate_pos_high`/`cov_gate_base`, which is the parameter block actually named
+"covariance gate" by its own identifiers and the one the historical doc most plausibly
+refers to. This doesn't change the test below, but it's worth recording the correction.
+What *is* still live: `mid_freq_motion_trigger` defaults `true` in the header and is `true`
+in every canonical `_nolow.yaml`. Confirmed directly in `mf_lio_estimator.cpp:249-263`:
+`motion_trigger` is computed whenever `params_.mid_freq_motion_trigger &&
+last_mid_freq_state_valid_` — independent of `mid_adaptive_enable` — and at line 289 it is
+OR'd directly into the mid-tier fire condition (`mid_time_trigger || motion_trigger ||
+lidar_trigger`). So only the covariance-gate half of the historical "both disabled" pairing
+is actually off in this reconstruction; the motion-trigger half is live. This is a genuine,
+previously-untested discrepancy, worth checking on its own merits.
+
+### Test config
+
+Created `handheld_mid360_params_v51_improved_nolow_notrigger_test.yaml`
+(`ros2_ws/src/mf_lio_v51/config/`), an exact copy of
+`handheld_mid360_params_v51_improved_nolow.yaml` with the single value
+`mid_freq_motion_trigger: true → false` changed. Diffed to confirm no other field
+differs. No canonical config file and no file under `ros2_ws/src/mf_lio_v51/` source was
+modified.
+
+### Build
+
+`mf_lio_v51:jazzy-postfixes` (`Created` `2026-10-22T19:58:48+03:00`) confirmed still
+current: `git log --since` against that timestamp shows zero commits touching `ros2_ws/`
+(the one commit since, `413d85b`, only touched this markdown file). Re-verified directly
+inside the image: `ros2 pkg executables mf_lio_v51` lists `mf_lio_v51_node`, and
+`include/mf_lio/mf_lio_estimator.h` contains both `fast_tier_max_catchup_fires` and the
+expected `mid_freq_motion_trigger = true` / `cov_gate_enable = true` header defaults
+(the latter overridden to `false` by the config file, as above). No rebuild was needed.
+
+### Runs
+
+Same methodology as the rest of this document: `ros2 run mf_lio_v51 mf_lio_v51_node`
++ rclpy TUM dumper on `/mf_lio_v51/odometry_fast` and `/mf_lio_v51/odometry_corrected`,
+`ros2 bag play --rate 1.0`, 5s settle before SIGINT, `evo_ape tum <gt> <corrected> -a`
+(SE(3), RMSE), `evo_rpe tum <gt> <fast> -d 1 -u m` (mean), run strictly sequentially,
+one `--network none` container at a time. All 5 runs (3×HandHeld-2, 1×HandHeld-1,
+1×HandHeld-3) clean: exit 0, no `error|exception|segfault|fatal` in `node.log`, full GT
+time-range coverage.
+
+**HandHeld-2, 3 trials, `mid_freq_motion_trigger: false`:**
+
+| Trial | ATE RMSE | RPE mean |
+|---|---|---|
+| 1 | 0.509270 | 0.591311 |
+| 2 | 0.458109 | 0.591187 |
+| 3 | 1.280720 | 0.591916 |
+| **mean** | **0.749366** | **0.591471** |
+| std (sample) | 0.461 | 0.0004 |
+| range | 0.458–1.281 | 0.591–0.592 |
+
+Compare to this document's existing two-tier-only (`_nolow`, `mid_freq_motion_trigger:
+true`) 5-trial baseline: **mean ATE 0.874 m, std 0.318 m, range 0.474–1.207 m** (RPE
+0.571–0.596). Paper: 0.2155 m. Historical overview's own number: 0.2727 m.
+
+**HandHeld-1 / HandHeld-3, 1 trial each, same test config:**
+
+| Seq | ATE RMSE (test) | ATE RMSE (nolow baseline) | Δ | RPE mean (test) | RPE mean (nolow) |
+|---|---|---|---|---|---|
+| HandHeld-1 | 0.048767 | 0.058261 | −16.3% | 1.026608 | 0.994894 |
+| HandHeld-3 | 0.045233 | 0.048851 | −7.4% | 0.519616 | 0.505508 |
+
+Both are flat-to-slightly-improved on ATE and flat-to-mildly-higher on RPE (+3.2%,
++2.8%) — within this document's already-documented trial-to-trial noise band
+(HandHeld-3 alone has ~20% spread documented earlier in this file), not a regression.
+
+### Context check: is `motion_trigger` even exercised on HandHeld-2?
+
+To interpret the (weak) mean shift above, a supplementary baseline run was added:
+`handheld_mid360_params_v51_improved_nolow.yaml` (unmodified, `mid_freq_motion_trigger:
+true`) on HandHeld-2, same methodology, counting `/odometry_corrected` messages (the
+mid-tier output) over the same ~23s playback:
+
+| Config | `/odometry_corrected` message count |
+|---|---|
+| `mid_freq_motion_trigger: true` (baseline) | 221 |
+| `mid_freq_motion_trigger: false` (test), trial 1/2/3 | 224 / 222 / 220 |
+
+These counts are statistically indistinguishable (±2 messages, consistent with ordinary
+playback/settle timing jitter between runs) and all land almost exactly at the ~10 Hz
+(`W_m_ms=100.0`) periodic-timer rate. **This indicates `motion_trigger` rarely or never
+fires independently of `mid_time_trigger` on this sequence** — the periodic timer alone
+already accounts for essentially every mid-tier update, so toggling `mid_freq_motion_trigger`
+has little-to-no mechanism to act through here. This is consistent with (and likely
+explains) the weak, noise-dominated result below.
+
+### Assessment
+
+**Does not meet this document's own bar for a genuine finding.** The decision rule
+required the 3-trial mean to land closer to the paper/baseline *and* show reduced
+variance (a tighter, lower spread) for this to be adopted. Only the first half is
+(mildly) true: mean ATE dropped from 0.874 m to 0.749 m (−14%), but the spread got
+*wider*, not tighter — new worst trial (1.281 m) exceeds the two-tier-only baseline's
+worst recorded trial (1.207 m), new std (≈0.46) exceeds the baseline's (0.318), and the
+best trial (0.458 m) is no closer to the paper's 0.2155 m than the baseline's own best
+(0.474 m). Combined with the context check above — the mechanism under test barely fires
+on this sequence to begin with — the most parsimonious explanation is that the modest
+mean shift is sampling noise from the same `N_max=4`/scheduling-jitter source already
+identified earlier in this document, not a causal effect of `mid_freq_motion_trigger`.
+HandHeld-1/HandHeld-3 do not regress, but that's moot given HandHeld-2 itself shows no
+clean win.
+
+**Conclusion: third negative result in this investigation chain** (after the speed-cap
+recalibration and the low-tier re-enable, both also reverted above). The historical
+`mf_lio_research_summary.md` "both disabled" pairing does not transparently explain this
+reconstruction's HandHeld-2 behavior either — most likely because, as with the low-tier
+case, the historical mechanism was built/tuned against implementation details (buffer
+fixes, race-condition fixes, degeneracy-gate revisions across v45→v51) not captured
+identically in this from-scratch reconstruction. **Per the task's decision rule, this
+change is reverted, not applied**: the test config
+(`handheld_mid360_params_v51_improved_nolow_notrigger_test.yaml`) was deleted after this
+write-up, no canonical `*_nolow.yaml` was touched, and no commit was made. The
+`N_max=4`/scheduling-jitter interaction remains the strongest standing explanation for
+HandHeld-2's residual gap, now with three independent mechanisms (speed-cap,
+low-tier, motion-trigger) ruled out as the fix.
