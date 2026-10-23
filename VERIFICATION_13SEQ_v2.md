@@ -594,3 +594,142 @@ committed**; the only artifacts are this documentation section (left uncommitted
 human review, matching this session's established pattern) and the scratch data under
 `scratch_out/` (gitignored-equivalent scratch area, not part of the repo tree, not
 committed).
+
+## HandHeld-2: testing the low-tier degeneracy guard (historical-overview hypothesis)
+
+New evidence surfaced on the mounted HDD (read-only, `/mnt/Workspace/LidarWorkSpace/results/`)
+after the speed-cap investigation above: `mf_lio_v51_overview.md` and
+`mf_lio_research_summary.md` both state HandHeld-2's good historical ATE (0.2727, both
+documents' own number — close to, but not identical to, the paper's published 0.2155)
+was achieved because **"the low-tier degeneracy guard prevents the drift spiral"**
+(`mf_lio_v51_overview.md` line 107). Both documents describe this guard under the "Low
+Tier" heading specifically (window 200-500 ms, "gated by map quality metrics
+(eigenvalue, residual RMSE); rejected on degenerate geometry"), distinct from the
+mid-tier's own `mid_degen_project_enable`/`mid_degen_map_gate_enable` guard (disabled by
+default in both historical and current configs) and distinct from the
+`correction_publish_gate_enable`/`should_publish_corrected` speed-cap mechanism
+investigated in the section above. All 13-sequence verification in this document so far
+used the `*_nolow.yaml` configs, which disable the low tier entirely
+(`W_l_min_ms=W_l_max_ms=1,000,000 ms`, i.e. it never fires in any sequence this short).
+This section tests whether re-enabling the low tier specifically — while keeping the two
+already-validated fixes (`N_max=4`, publication gate) — recovers the historical result.
+
+Confirmed in the reconstructed source (`mf_lio_estimator.cpp` ~2399-2470) that the low
+tier does implement a real, distinct degeneracy-aware mechanism: an information-gain-ratio
+(IGR) per-axis blend (`alpha_k = lambda_l_k / (lambda_l_k + v_k^T H_m v_k)`), eigendecomposing
+the low tier's own accumulated position Fisher information (`last_pos_HtH_`) and damping or
+fully rejecting (`low_freq_trust_reject`, `low_freq_min_trust_alpha`) the correction in any
+direction the low tier itself isn't well-constrained in — functionally the "degeneracy
+guard, gated by eigenvalue/residual-RMSE quality metrics" the historical documents describe.
+This confirms the task's premise: this is a real, separate mechanism from the
+speed-cap gate, worth testing on its own.
+
+### Test config
+
+Created `handheld_mid360_params_v51_improved_lowtier_test.yaml`
+(`ros2_ws/src/mf_lio_v51/config/`), a copy of the base
+`handheld_mid360_params_v51_improved.yaml` (which already has the low tier enabled with
+its own pre-existing platform-tuned window, `W_l_min_ms=150.0`/`W_l_max_ms=200.0` —
+confirmed untouched) with exactly two values changed to match the validated `_nolow`
+settings: `num_max_iterations: 20 → 4`, `correction_publish_gate_enable: false → true`.
+Diffed against both canonical files to confirm the combination is exact:
+
+```
+diff vs handheld_mid360_params_v51_improved.yaml (base):
+    num_max_iterations: 20 → 4
+    correction_publish_gate_enable: false → true
+  (nothing else differs — all handheld-specific tuning, including W_l_min/max, untouched)
+
+diff vs handheld_mid360_params_v51_improved_nolow.yaml:
+    W_l_base_ms: 1000000.0 → 200.0
+    W_l_min_ms:  1000000.0 → 150.0
+    W_l_max_ms:  1000000.0 → 200.0
+  (nothing else differs — num_max_iterations=4 and gate=true already match)
+```
+
+No canonical config file and no file under `ros2_ws/src/mf_lio_v51/` source was modified.
+
+### Build
+
+`mf_lio_v51:jazzy-postfixes` (`Created` `2026-10-22T19:58:48+03:00`) was confirmed still
+current: `git log --since` against that timestamp shows no commits touching `ros2_ws/`
+since the image was built (the one commit since then, `a764540`, only touched this
+markdown file). Re-verified directly inside the image: `ros2 pkg executables mf_lio_v51`
+lists `mf_lio_v51_node`, and `include/mf_lio/mf_lio_estimator.h` contains
+`fast_tier_max_catchup_fires`. No rebuild was needed.
+
+### Runs
+
+Same methodology as the rest of this document (`ros2 run mf_lio_v51 mf_lio_v51_node`
++ rclpy TUM dumper on `/mf_lio_v51/odometry_fast` and `/mf_lio_v51/odometry_corrected`,
+`ros2 bag play --rate 1.0`, 5 s settle before SIGINT, `evo_ape tum <gt> <corrected> -a`,
+`evo_rpe tum <gt> <fast> -d 1 -u m`), run strictly sequentially (one container at a
+time, `--network none` per container) per the cross-container DDS contamination hazard
+already documented above. All runs clean: exit 0, no `error|exception|segfault|fatal`
+in `node.log`, 100% GT time-range coverage.
+
+**HandHeld-2, 3 trials, low-tier-enabled test config:**
+
+| Trial | ATE RMSE | RPE mean |
+|---|---|---|
+| 1 | 1.377068 | 0.626923 |
+| 2 | 0.497848 | 0.621081 |
+| 3 | 0.517399 | 0.619813 |
+| **mean** | **0.797438** | **0.622606** |
+| std | 0.410 | 0.004 |
+| range | 0.498–1.377 | 0.620–0.627 |
+
+Compare to this document's own previous 5-trial two-tier-only (`_nolow`) baseline:
+**mean ATE 0.874 m, std 0.318 m, range 0.474–1.207 m** (RPE 0.571–0.596).
+
+**HandHeld-1 / HandHeld-3, 1 trial each, same test config:**
+
+| Seq | ATE RMSE (test config) | ATE RMSE (nolow, from table above) | Δ | RPE mean (test) | RPE mean (nolow) |
+|---|---|---|---|---|---|
+| HandHeld-1 | 0.060829 | 0.058261 | +4.4% | 1.014118 | 0.994894 |
+| HandHeld-3 | 0.043399 | 0.048851 | −11.2% | 0.519180 | 0.505508 |
+
+### Assessment
+
+**The historical overview's claim does not transparently reproduce in the current
+reconstructed codebase.** The low-tier-enabled test config's 3-trial ATE mean (0.797 m)
+is only marginally lower than the two-tier-only 5-trial mean (0.874 m) — well inside the
+existing trial-to-trial noise band, not a meaningful improvement. Critically, the test
+config's own trial range (0.498–1.377 m) is *wider*, not narrower, than the
+two-tier-only range (0.474–1.207 m): its worst trial (1.377) is worse than the
+two-tier-only config's worst recorded trial (1.207), and its best trial (0.498) is
+essentially the same as the two-tier-only config's best (0.474). Neither the paper's
+0.2155 m nor the historical overview's own 0.2727 m is approached by any of the 3
+trials — the closest trial (0.498 m) is still ~1.8–2.3x those targets. In other words,
+enabling the low tier exactly as the base config already tunes it, on top of the two
+already-validated fixes, **does not recover the historical result and does not reduce
+the trial-to-trial variance** that this document's own earlier instrumented root-cause
+(the "Step 2" findings above) attributed to `N_max=4` interacting with real-time
+scheduling jitter during HandHeld-2's fast motion.
+
+HandHeld-1 and HandHeld-3 do **not** regress badly: HandHeld-1 is flat within noise
+(+4.4%), HandHeld-3 is actually slightly closer to the nolow result (−11.2%, likely
+itself just trial noise given HandHeld-3's own ~20% trial-to-trial spread documented
+earlier in this file). So enabling the low tier is not harmful to the other two handheld
+sequences — but it also does not deliver the HandHeld-2 fix the historical documents
+implied.
+
+**Conclusion: this is a genuine negative result, not a confirmation.** The most likely
+explanation, per the task's own anticipated fallback: the historical system's low-tier
+degeneracy guard — built, tuned, and validated against an earlier, different
+implementation state (the `mf_lio_research_summary.md` changelog documents numerous
+low-tier revisions across versions, e.g. "fixed low-tier race condition," "IMU
+consistency threshold... always set to 0.0," cross-tier backward-correction additions)
+— does not behave identically in this session's from-scratch reconstruction, even though
+the mechanism it describes (IGR-based per-axis eigenvalue gating) is genuinely present
+and active in the reconstructed code. This narrows, rather than resolves, the
+investigation: HandHeld-2's residual gap now looks most consistent with the
+`N_max=4`/scheduling-jitter interaction flagged but not isolated earlier in this
+document, independent of which tier's degeneracy guard is active. **Recommendation:**
+do not adopt the low tier for HandHeld as a fix on this evidence; if a human wants to
+pursue this further, the next step would be isolating `N_max`'s effect on trial-to-trial
+variance directly (e.g. re-running the two-tier-only config at `N_max=20` on HandHeld-2
+to see if the variance itself — not just the mean — shrinks), rather than further
+low-tier tuning. No canonical config file or suite-wide default was changed; the test
+config (`handheld_mid360_params_v51_improved_lowtier_test.yaml`) and this section are
+left uncommitted for human review.
